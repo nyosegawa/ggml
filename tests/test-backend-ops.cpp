@@ -5046,6 +5046,30 @@ struct test_mul_mat : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT with large values: activations from b_min to b_max and weights from a_min to a_max, so that a block of
+// 32 activations sums past half precision (65504), or the products themselves do, either of which a backend that
+// carries them in half precision turns into inf, NaN or 65504
+struct test_mul_mat_large_b : public test_mul_mat {
+    const float a_min, a_max, b_min, b_max;
+
+    test_mul_mat_large_b(ggml_type type_a, int64_t m, int64_t n, int64_t k, float a_min, float a_max, float b_min, float b_max)
+        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}), a_min(a_min), a_max(a_max), b_min(b_min), b_max(b_max) {}
+
+    std::string vars() override {
+        return test_mul_mat::vars() + ",large_b=1," + VARS_TO_STR4(a_min, a_max, b_min, b_max);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "b") == 0) {
+                init_tensor_uniform(t, b_min, b_max);
+            } else {
+                init_tensor_uniform(t, a_min, a_max);
+            }
+        }
+    }
+};
+
 // GGML_HINT_SRC0_IS_HADAMARD
 struct test_mul_mat_hadamard : public test_mul_mat {
     test_mul_mat_hadamard(ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
@@ -9003,6 +9027,21 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // outputs of 64 modulo 128 columns, past which Metal's tensor-API kernel_mul_mm stored its last tile
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 64, 256, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 1024, 192, 256, {1, 1}, {1, 1}));
+    // the types whose q8_1 dot product reads the activations' block sums, with sums or products past half precision;
+    // Q4_1 and Q5_1 are left out, since the CPU, which the cases are compared with, carries their sums in half precision
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (int64_t n : {1, 4, 64}) {
+            const int64_t k = n == 1 ? 8192 : 1024;
+            // block sums past half precision
+            test_cases.emplace_back(new test_mul_mat_large_b(type, 64, n, k, -1.0f, 1.0f, 2048.0f, 4096.0f));
+            // block sums within half precision, products past it
+            test_cases.emplace_back(new test_mul_mat_large_b(type, 64, n, k, 0.5f, 1.0f, 512.0f, 1024.0f));
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
