@@ -5849,7 +5849,7 @@ struct test_rope : public test_case {
     float ef; // ext_factor
     float af; // attn_factor
     bool ff;
-    int v; // view (1 : non-contiguous a)
+    int v; // view (1 : non-contiguous a, 2 : a at an offset along dim 0, 4 : pos and freq at an offset of one element)
     bool forward;
     bool inplace;
     int n_offs; // offset of the rotated dims window, set via ggml_rope_set_offset()
@@ -5907,18 +5907,26 @@ struct test_rope : public test_case {
         const bool is_mrope = mode & GGML_ROPE_TYPE_MROPE;
         const bool is_vision = mode == GGML_ROPE_TYPE_VISION;
 
-        ggml_tensor * pos;
-        if (is_mrope || is_vision) {
-            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne_a[2] * 4);
-        } else {
-            pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ne_a[2]);
-        }
+        // With v == 4 the positions and the frequency factors are views that start one element into tensors one element
+        // longer, as a graph that keeps the positions of several steps in one tensor reads each step's: their buffer
+        // offset is then not a multiple of the alignment a backend binds buffers at.
+        const int64_t view_offs = v == 4 ? 1 : 0;
+        const int64_t num_pos = (is_mrope || is_vision) ? ne_a[2] * 4 : ne_a[2];
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, num_pos + view_offs);
         ggml_set_name(pos, "pos");
+        if (view_offs) {
+            pos = ggml_view_1d(ctx, pos, num_pos, view_offs * ggml_element_size(pos));
+            ggml_set_name(pos, "view_of_pos");
+        }
 
         ggml_tensor * freq = nullptr;
         if (ff) {
-            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2);
+            freq = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_dims/2 + view_offs);
             ggml_set_name(freq, "freq");
+            if (view_offs) {
+                freq = ggml_view_1d(ctx, freq, n_dims/2, view_offs * ggml_element_size(freq));
+                ggml_set_name(freq, "view_of_freq");
+            }
         }
 
         ggml_tensor * out;
@@ -5971,14 +5979,14 @@ struct test_rope : public test_case {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (t->type == GGML_TYPE_I32) {
                 // pos
-                const int num_pos_ids = (mode & GGML_ROPE_TYPE_MROPE) ? ne_a[2] * 4 : ne_a[2];
+                const int num_pos_ids = ggml_nelements(t);
                 std::vector<int> data(num_pos_ids);
                 for (int i = 0; i < num_pos_ids; i++) {
                     data[i] = rand() % n_ctx;
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, num_pos_ids * sizeof(int));
             } else {
-                if (t->ne[0] == n_dims/2) {
+                if (t->ne[0] == n_dims/2 || strcmp(t->name, "freq") == 0) {
                     // frequency factors in the range [0.9f, 1.1f]
                     init_tensor_uniform(t, 0.9f, 1.1f);
                 } else {
@@ -10557,6 +10565,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 0, true, true));
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 1, true, true));
                 test_cases.emplace_back(new test_rope(type, {128,  32, 2, 3}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 1, true, true));
+            }
+        }
+    }
+
+    // positions and frequency factors read through views at an offset of one element
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool fw : {true, false}) { // fw == forward
+            for (bool ff : {false, true}) {
+                for (int mode : {GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_VISION}) {
+                    test_cases.emplace_back(new test_rope(type, {128, 16, 3, 1}, 128, mode, 512, 1.4245f, 0.7465f, 1.4245f, ff, 4, fw));
+                }
             }
         }
     }
