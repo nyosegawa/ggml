@@ -4133,9 +4133,11 @@ struct test_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
+// With channels_first, x is [C, T] and a / inv_b are [C], as in DAC-style codecs.
 struct test_snake_fuse : public test_case {
     const ggml_type type;
-    const std::array<int64_t, 4> ne;   // [T, C, D2, D3]
+    const std::array<int64_t, 4> ne;   // [T, C, D2, D3], or [C, T, D2, D3] with channels_first
+    const bool channels_first;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4156,21 +4158,24 @@ struct test_snake_fuse : public test_case {
     }
 
     std::string vars() override {
-        return VARS_TO_STR2(type, ne);
+        return VARS_TO_STR3(type, ne, channels_first);
     }
 
     test_snake_fuse(ggml_type type = GGML_TYPE_F32,
-            std::array<int64_t, 4> ne = {256, 192, 1, 1})
-        : type(type), ne(ne) {}
+            std::array<int64_t, 4> ne = {256, 192, 1, 1},
+            bool channels_first = false)
+        : type(type), ne(ne), channels_first(channels_first) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_4d(ctx, type, ne[0], ne[1], ne[2], ne[3]);
         ggml_set_name(x, "x");
 
-        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        ggml_tensor * a = channels_first ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0])
+                                         : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
         ggml_set_name(a, "a");
 
-        ggml_tensor * inv_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
+        ggml_tensor * inv_b = channels_first ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0])
+                                             : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, ne[1]);
         ggml_set_name(inv_b, "inv_b");
 
         // exact 5-op chain that BigVGAN / Vocos frontends emit
@@ -9096,6 +9101,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 1}));   // ne[2] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 1, 2}));   // ne[3] > 1
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
+        // channels in ne[0], a / inv_b of [C]
+        test_cases.emplace_back(new test_snake_fuse(type, {   7,     5, 1, 1}, true));   // primes sub-block
+        test_cases.emplace_back(new test_snake_fuse(type, {  32,    33, 1, 1}, true));   // boundary
+        test_cases.emplace_back(new test_snake_fuse(type, {  13,  1025, 1, 1}, true));   // large prime
+        test_cases.emplace_back(new test_snake_fuse(type, {   1,    33, 1, 1}, true));   // one channel
+        test_cases.emplace_back(new test_snake_fuse(type, {  33,     1, 1, 1}, true));   // one sample
+        test_cases.emplace_back(new test_snake_fuse(type, {  96, 70000, 1, 1}, true));   // ne[1] past 65535 workgroups
+        test_cases.emplace_back(new test_snake_fuse(type, {  32,    64, 2, 1}, true));   // ne[2] > 1, not fused
     }
 
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));

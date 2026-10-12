@@ -4768,9 +4768,9 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * a = (x == mul0->src[0]) ? mul0->src[1] : mul0->src[0];
     const ggml_tensor * inv_b = (mul1->src[0] == sqr) ? mul1->src[1] : mul1->src[0];
 
-    const int T     = (int) x->ne[0];
-    const int C     = (int) x->ne[1];
-    const int total = T * C;
+    const int ne0   = (int) x->ne[0];
+    const int ne1   = (int) x->ne[1];
+    const int total = ne0 * ne1;
 
     // the encode loop pre-checked the leading mul only, check the rest of the chain
     for (int i = 1; i < 5; ++i) {
@@ -4784,8 +4784,9 @@ int ggml_metal_op_snake_fused(ggml_metal_op_t ctx, int idx) {
     auto pipeline = ggml_metal_library_get_pipeline_snake(lib, x->type);
 
     ggml_metal_kargs_snake args = {
-        /*.T =*/ T,
-        /*.C =*/ C,
+        /*.ne0  =*/ ne0,
+        /*.ne1  =*/ ne1,
+        /*.cdim =*/ a->ne[0] == 1 && a->ne[1] == ne1 ? 1 : 0,
     };
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);

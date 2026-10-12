@@ -308,8 +308,9 @@ static bool ggml_metal_fusion_check_snake(
         (sqr->type  == x->type)       && (mul1->type     == x->type) &&
         (add->type  == x->type);
 
-    // a / inv_b collapse to [1, C, 1, 1], x and add stay 2D
-    const bool shape_ok = ggml_are_same_shape(a, inv_b) && a->ne[0] == 1 && a->ne[1] == x->ne[1];
+    // a / inv_b collapse to [1, C, 1, 1] for x as [T, C] or to [C, 1, 1, 1] for x as [C, T], x and add stay 2D
+    const bool shape_ok = ggml_are_same_shape(a, inv_b) &&
+        ((a->ne[0] == 1 && a->ne[1] == x->ne[1]) || (a->ne[0] == x->ne[0] && a->ne[1] == 1));
     const bool dim_ok =
         (x->ne[2]     == 1) && (x->ne[3]     == 1) &&
         (add->ne[2]   == 1) && (add->ne[3]   == 1) &&

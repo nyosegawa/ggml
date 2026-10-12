@@ -620,6 +620,7 @@ struct vk_op_conv_transpose_1d_push_constants {
 struct vk_op_snake_push_constants {
     uint32_t ne0;
     uint32_t ne1;
+    uint32_t cdim; // the dim of x that a and inv_b index: 1 for x as [T, C], 0 for x as [C, T]
 };
 
 struct vk_op_pool1d_push_constants {
