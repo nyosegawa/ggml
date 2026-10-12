@@ -1133,17 +1133,14 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     dev->props.has_tensor = false;
                 }
 
-                // note: disable the tensor API by default for old chips because with the current implementation it is not useful
+                // note: the tensor API is off by default on every chip, the M5, M6, A19 and A20 included: on an Apple M5,
+                // kernel_mul_mm on it stores past its output when 64 columns remain, computes less precisely than the
+                // simdgroup kernel under relaxed precision, and is slower than it without
                 // - M2 Ultra:   ~5% slower
                 // - M4, M4 Max: no significant difference
-                //
-                // TODO: try to update the tensor API kernels to at least match the simdgroup performance
-                if (getenv("GGML_METAL_TENSOR_ENABLE") == NULL &&
-                    ![[dev->mtl_device name] containsString:@"M5"] &&
-                    ![[dev->mtl_device name] containsString:@"M6"] &&
-                    ![[dev->mtl_device name] containsString:@"A19"] &&
-                    ![[dev->mtl_device name] containsString:@"A20"]) {
-                    GGML_LOG_INFO("%s: tensor API disabled for pre-M5 and pre-A19 devices\n", __func__);
+                // - M5:         speech models 22% to 85% slower to their first result without relaxed precision
+                if (getenv("GGML_METAL_TENSOR_ENABLE") == NULL) {
+                    GGML_LOG_INFO("%s: tensor API disabled\n", __func__);
                     dev->props.has_tensor = false;
                 }
 
