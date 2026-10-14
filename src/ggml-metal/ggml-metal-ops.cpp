@@ -5163,8 +5163,11 @@ int ggml_metal_op_argmax(ggml_metal_op_t ctx, int idx) {
 
     const int64_t nrows = ggml_nrows(op->src[0]);
 
+    // each row is one threadgroup, which reads it at the bandwidth its threads draw: Qwen3's 151,936 logits took 72 us
+    // with 256 threads and 402 us for four rows with 64 each on an Apple M5
+    const int nth_max = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);
     int nth = 32; // SIMD width
-    while (nth < ne00 && nth*ne01*ne02*ne03 < 256) {
+    while (nth < ne00 && 2*nth <= nth_max) {
         nth *= 2;
     }
 

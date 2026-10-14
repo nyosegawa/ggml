@@ -9612,6 +9612,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {ne0, ne1, 1, 1}, true));
         }
     }
+    for (int64_t ne1 : {1, 4, 8}) {
+        test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {151936, ne1, 1, 1}));
+    }
 
     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
