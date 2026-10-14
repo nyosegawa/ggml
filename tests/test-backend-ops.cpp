@@ -9063,6 +9063,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_large_b(type, 64, n, k, 0.5f, 1.0f, 512.0f, 1024.0f));
         }
     }
+    // Metal's kernel_mul_mm on the tensor API's matrix units, in every weight type speech.cpp ships, with its tiles of 32
+    // and of 64 columns: outputs whose rows and columns end inside a tile, K that does not fill the last step of a tile,
+    // broadcast batches, permuted and strided activations, and activations in half precision
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        const int64_t k = ggml_blck_size(type) == 256 ? 768 : 288;
+        for (int64_t n : {9, 16, 31, 32, 33, 63, 64, 65, 77, 127, 128, 129, 192, 200}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 999, n, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t m : {1, 31, 64, 65, 200}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, 77, k, {1, 1}, {1, 1}));
+        }
+        for (int64_t n : {77, 128}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 600, n, k, {2, 3}, {2, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 600, n, k, {3, 2}, {1, 1}, {0, 2, 1, 3}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 600, n, k, {2, 1}, {1, 1}, {0, 1, 2, 3}, 2*k));
+        }
+    }
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (int64_t k : {80, 83, 240, 1000}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 129, 77, k, {1, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, 128, k, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 200, 77, 288, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 1024, 128, 288, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 129, 65, 83, {2, 1}, {1, 1}));
+    }
+
     std::default_random_engine rng(0);
 
     // unary ops

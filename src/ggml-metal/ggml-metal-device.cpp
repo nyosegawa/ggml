@@ -791,6 +791,20 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
     return res;
 }
 
+// The tensor API's kernel_mul_mm computes 64 rows of the output by 32 or 64 of its columns, which give the same
+// products bit for bit. The 64 columns are faster where their tiles cover the output with no more columns than tiles of
+// 32 and are many: on an Apple M5 (2026-10-15), over 549 products of F32, F16 and Q8_0 weights with K from 96 to 3072,
+// 1 to 3072 rows and 33 to 61440 columns, this choice ran 1.99 times as fast as the simdgroup kernel (geometric mean),
+// tiles of 32 columns alone 1.91 times, and the faster of the two for each product 2.01 times.
+static int ggml_metal_mul_mm_tensor_nr1(const ggml_tensor * op) {
+    const int64_t ne0 = op->ne[0];
+    const int64_t ne1 = op->ne[1];
+
+    const int64_t tiles = (ne0 + 63)/64*((ne1 + 63)/64)*op->ne[2]*op->ne[3];
+
+    return ne0 >= 256 && ne1 > 64 && (ne1 + 63)/64*64 == (ne1 + 31)/32*32 && tiles >= 32 ? 64 : 32;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_metal_library_t lib, const ggml_tensor * op) {
     char base[256];
     char name[256];
@@ -800,14 +814,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
     const bool bc_inp = op->src[0]->ne[0] % 32 != 0;
 
-    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
-
     const bool has_tensor = ggml_metal_device_get_props(ggml_metal_library_get_device(lib))->has_tensor;
 
-    const bool bc_out = has_tensor
-        ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
-        : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
+    const int nr1 = has_tensor ? ggml_metal_mul_mm_tensor_nr1(op) : 32;
+
+    const bool bc_out = op->ne[0] % 64 != 0 || op->ne[1] % nr1 != 0;
 
     GGML_ASSERT(op->src[1]->ne[2] <= INT16_MAX && op->src[1]->ne[3] <= INT16_MAX);
     const int16_t ne12 = (int16_t) op->src[1]->ne[2];
@@ -816,8 +827,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
-             base, bc_inp, bc_out, ne12, ne13, r2, r3);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_nr1=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
+             base, bc_inp, bc_out, nr1, ne12, ne13, r2, r3);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -829,26 +840,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ggml_metal_cv_set_int16(cv, ne13,  FC_MUL_MM + 3);
         ggml_metal_cv_set_int16(cv, r2,    FC_MUL_MM + 4);
         ggml_metal_cv_set_int16(cv, r3,    FC_MUL_MM + 5);
+        ggml_metal_cv_set_bool(cv, nr1 == 64, FC_MUL_MM + 7);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 
         ggml_metal_cv_free(cv);
     }
 
+    res.nr0 = 64;
+    res.nr1 = nr1;
+    res.nsg = 4;
+
     if (has_tensor) {
-        res.nr0 = NRA;
-        res.nr1 = NRB;
-
-        const size_t smem_a = NRA * N_MM_NK_TOTAL * sizeof(ggml_fp16_t);
-        res.smem = smem_a;
+        // two buffers of the operands of a step, or the tile of the output that ends past it
+        res.smem = std::max(2*(64 + nr1)*32*sizeof(ggml_fp16_t), 64*nr1*sizeof(float));
     } else {
-        res.nr0 = 64;
-        res.nr1 = 32;
-
         res.smem = bc_out ? 8192 : (4096 + 2048);
     }
-
-    res.nsg = N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
 
     return res;
 }
