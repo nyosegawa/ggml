@@ -2374,13 +2374,16 @@ struct test_get_rows : public test_case {
     const bool v; // view src1
     const bool vs0; // view src0
     const int offset_cols; // // column offset of the view src0
+    // the values are drawn from [-range, range]: models' weights are small, which makes their quantized scales small
+    const float range;
 
     std::string vars() override {
-        return VARS_TO_STR9(type, n, m, r, be1, be2, v, vs0, offset_cols);
+        return VARS_TO_STR10(type, n, m, r, be1, be2, v, vs0, offset_cols, range);
     }
 
-    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0)
-        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols) {}
+    test_get_rows(ggml_type type = GGML_TYPE_F32, int n = 10, int m = 5, int r = 3, int be1 = 1, int be2 = 1, bool v = false, bool vs0 = false, int offset_cols = 0,
+            float range = 1.0f)
+        : type(type), n(n), m(m), r(r), be1(be1), be2(be2), v(v), vs0(vs0), offset_cols(offset_cols), range(range) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * in;
@@ -2431,7 +2434,7 @@ struct test_get_rows : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -range, range);
             }
         }
     }
@@ -9241,6 +9244,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // weights of a model's size, whose 4-bit scales divided by 16 fall below half precision's normal numbers
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K}) {
+        for (float range : {0.04f, 0.004f}) {
+            test_cases.emplace_back(new test_get_rows(type, 1024, 8, 4, 1, 1, false, false, 0, range));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
