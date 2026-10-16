@@ -10810,7 +10810,7 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
         (uint32_t)src0->ne[2],
         nb01, nb02, nb03,
         nb11, nb12, nb13,
-        0, 0, // a_offset, d_offset filled in by init_pushconst_tensor_offsets
+        0, 0, 0, 0, // a_offset, d_offset, pos_offset, ff_offset filled in by init_pushconst_tensor_offsets
     };
 
     return rope;
@@ -10983,6 +10983,13 @@ void ggml_vk_rms_norm(ggml_backend_vk_context * ctx, vk_context& subctx, const s
         // Round the binding offset down to the storage buffer alignment; the in-element shift goes in pc.rope.d_offset.
         pc.rope.d_offset = get_misalign_bytes(ctx, tensors[5]) / ggml_type_size(tensors[5]->type);
         offset[5] &= ~(size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment) - 1);
+        // The positions and the frequency factors are bound the same way, their shifts in pc.rope.
+        pc.rope.pos_offset = get_misalign_bytes(ctx, tensors[3]) / ggml_type_size(tensors[3]->type);
+        offset[3] &= ~(size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment) - 1);
+        if (tensors[4]) {
+            pc.rope.ff_offset = get_misalign_bytes(ctx, tensors[4]) / ggml_type_size(tensors[4]->type);
+            offset[4] &= ~(size_t(ctx->device->properties.limits.minStorageBufferOffsetAlignment) - 1);
+        }
 
         std::array<uint32_t, 3> elements;
         elements = { (uint32_t)rms->src[0]->ne[1], (uint32_t)rms->src[0]->ne[2], (uint32_t)rms->src[0]->ne[3] };
