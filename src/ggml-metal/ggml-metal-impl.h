@@ -674,8 +674,9 @@ typedef struct {
 } ggml_metal_kargs_col2im_1d;
 
 typedef struct {
-    int32_t T;
-    int32_t C;
+    int32_t ne0;
+    int32_t ne1;
+    int32_t cdim; // the dim of x that a and inv_b index: 1 for x as [T, C], 0 for x as [C, T]
 } ggml_metal_kargs_snake;
 
 typedef struct {

@@ -11992,10 +11992,21 @@ void ggml_vk_snake_dispatch_fused(ggml_backend_vk_context * ctx, vk_context& sub
     vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, add);
 
     vk_op_snake_push_constants pc{};
-    pc.ne0 = static_cast<uint32_t>(x->ne[0]);
-    pc.ne1 = static_cast<uint32_t>(x->ne[1]);
+    pc.ne0  = static_cast<uint32_t>(x->ne[0]);
+    pc.ne1  = static_cast<uint32_t>(x->ne[1]);
+    pc.cdim = a->ne[0] == 1 && a->ne[1] == x->ne[1] ? 1 : 0;
 
-    std::array<uint32_t, 3> elements = { pc.ne0, pc.ne1, 1 };
+    // x as [C, T] has ne1 = T, often past maxComputeWorkGroupCount[1], so the
+    // dispatch covers the elements as a flat range, as the unary ops do.
+    const uint32_t ne = pc.ne0 * pc.ne1;
+    std::array<uint32_t, 3> elements;
+    if (ne > 262144) {
+        elements = { 512, 512, CEIL_DIV(ne, 262144) };
+    } else if (ne > 512) {
+        elements = { 512, CEIL_DIV(ne, 512), 1 };
+    } else {
+        elements = { ne, 1, 1 };
+    }
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { x_buf, a_buf, inv_b_buf, dst_buf }, pc, elements);
 }
 
@@ -14165,17 +14176,18 @@ bool ggml_vk_can_fuse_snake(ggml_backend_vk_context * ctx, const struct ggml_cgr
     if (!ggml_are_same_shape(a, inv_b)) {
         return false;
     }
-    if (a->ne[0] != 1 || a->ne[1] != x->ne[1]) {
+    // a / inv_b collapse to [1, C, 1, 1] for x as [T, C] or to [C, 1, 1, 1] for x as [C, T]
+    if (!(a->ne[0] == 1 && a->ne[1] == x->ne[1]) && !(a->ne[0] == x->ne[0] && a->ne[1] == 1)) {
         return false;
     }
-    // Dispatch is 2D over (ne0, ne1), so x and add must be 2D and a / inv_b
-    // must collapse to [1, C, 1, 1]. Higher dims are not handled by the shader.
+    // The shader indexes ne0 * ne1 elements, so x and add must be 2D.
+    // Higher dims are not handled by the shader.
     if (x->ne[2]     != 1 || x->ne[3]     != 1) return false;
     if (add->ne[2]   != 1 || add->ne[3]   != 1) return false;
     if (a->ne[2]     != 1 || a->ne[3]     != 1) return false;
     if (inv_b->ne[2] != 1 || inv_b->ne[3] != 1) return false;
-    // Shader uses idx = i0 + i1 * ne0 and reads data_b[i1] / data_c[i1],
-    // so every operand must be contiguous.
+    // Shader reads x and writes add at a flat index and reads data_b / data_c
+    // at the channel of that index, so every operand must be contiguous.
     if (!ggml_is_contiguous(x) || !ggml_is_contiguous(add) ||
         !ggml_is_contiguous(a) || !ggml_is_contiguous(inv_b)) {
         return false;

@@ -396,11 +396,11 @@ kernel void kernel_snake(
         uint         ntg   [[threads_per_threadgroup]]) {
 
     const int idx = tgpig * ntg + tpitg;
-    if (idx >= args.T * args.C) {
+    if (idx >= args.ne0 * args.ne1) {
         return;
     }
 
-    const int   c  = idx / args.T;  // x is [T, C], a / inv_b collapse to [1, C]
+    const int   c  = args.cdim == 0 ? idx % args.ne0 : idx / args.ne0;
     const float xi = float(x[idx]);
     const float si = sin(a[c] * xi);
     dst[idx] = T(xi + si * si * inv_b[c]);
