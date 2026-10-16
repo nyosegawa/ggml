@@ -9,18 +9,153 @@ constant short FC_mul_mm_r2    [[function_constant(FC_MUL_MM + 4)]];
 constant short FC_mul_mm_r3    [[function_constant(FC_MUL_MM + 5)]];
 constant bool FC_mul_mm_id_amax [[function_constant(FC_MUL_MM + 6)]];
 constant int32_t FC_mul_mm_id_map0_ne02 [[function_constant(FC_MUL_MM + 7)]];
+constant bool FC_mul_mm_nr1_64 [[function_constant(FC_MUL_MM + 8)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
+// A threadgroup multiplies 64 rows of src0 by NR1 rows of src1 on the matrix units of Metal's tensor API, 32 columns a
+// step. Each step's operands are staged in threadgroup memory in S0 and S1 (half, or bfloat for BF16), as the simdgroup
+// kernel stages them, and the units multiply them without relaxed precision: they then sum the exact products of the
+// staged values in float, so that the result is the simdgroup kernel's up to the order of the sums. With relaxed
+// precision, given float activations, an Apple M5 computes less precisely: on speech.cpp's products (2026-10-15) the
+// result lies 2e-7 to 3e-7 in NMSE from the exact product of the operands rounded to half, where this kernel's lies
+// 5e-15 to 5e-13 and the simdgroup kernel's 1e-14 to 2e-12. The next step's operands are read from device memory while
+// the units multiply the current step's, into the other of two buffers, so that a step waits at one barrier.
 template<
-    typename SA, typename SA_4x4, typename SA_8x8,
-    typename SB, typename SB_2x4, typename SB_8x8,
-    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread SA_4x4 &),
+    short NR1,
+    typename S0, typename S0_4x4, typename S1, typename S1_2x4,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
+    typename T0, typename T0_4x4, typename T1, typename T1_2x4>
+void kernel_mul_mm_tensor_impl(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiitg) {
+    constexpr short NR0 = 64;
+    constexpr short NK  = 32;
+    constexpr short NT  = 4*N_SIMDWIDTH;
+
+    // one piece of 16 values of src0 and NB pieces of 8 values of src1 per thread and step
+    constexpr short NB = NR1*NK/8/NT;
+    static_assert(NR0*NK/16 == NT && NB*NT == NR1*NK/8, "a thread loads whole pieces");
+
+    constexpr int SZ = NR0*NK*sizeof(S0) + NR1*NK*sizeof(S1);
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const int nr0 = min(args.ne0 - r0, (int) NR0);
+    const int nr1 = min(args.ne1 - r1, (int) NR1);
+
+    const int i12 = im % FC_mul_mm_ne12;
+    const int i13 = im / FC_mul_mm_ne12;
+
+    // a row past the output reads the last row of the matrix, and its products are not stored
+    const short la = tiitg/(NK/16);
+    const short ka = 16*(tiitg%(NK/16));
+
+    device const char * x = src0 + (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03 + args.nb01*(r0 + min((int) la, nr0 - 1));
+
+    device const T1 * y[NB];
+    short lb[NB];
+    short kb[NB];
+
+    FOR_UNROLL (short j = 0; j < NB; ++j) {
+        const short w = tiitg + j*NT;
+
+        lb[j] = w/(NK/8);
+        kb[j] = 8*(w%(NK/8));
+        y[j]  = (device const T1 *) (src1 + i12*args.nb12 + i13*args.nb13 + args.nb11*(r1 + min((int) lb[j], nr1 - 1)));
+    }
+
+    S0_4x4 ra;
+    S1_2x4 rb[NB];
+
+    auto load = [&](int k0) {
+        if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
+            FOR_UNROLL (short i = 0; i < 16; ++i) {
+                ra[i/4][i%4] = k0 + ka + i < args.ne00 ? (S0) ((device const T0 *) x)[k0 + ka + i] : (S0) 0;
+            }
+        } else {
+            dequantize_func((device const block_q *) x + (k0 + ka)/(16*nl), ((k0 + ka)/16)%nl, ra);
+        }
+
+        FOR_UNROLL (short j = 0; j < NB; ++j) {
+            if (FC_mul_mm_bc_inp) {
+                FOR_UNROLL (short i = 0; i < 8; ++i) {
+                    rb[j][i/4][i%4] = k0 + kb[j] + i < args.ne00 ? (S1) y[j][k0 + kb[j] + i] : (S1) 0;
+                }
+            } else {
+                rb[j] = (S1_2x4) *((device const T1_2x4 *) (y[j] + k0 + kb[j]));
+            }
+        }
+    };
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(NR1, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    using tensor_a = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>;
+    using tensor_b = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>;
+
+    auto cT = mm.template get_destination_cooperative_tensor<tensor_b, tensor_a, float>();
+
+    FOR_UNROLL (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        cT[i] = 0.0f;
+    }
+
+    load(0);
+
+    short buf = 0;
+
+    for (int k0 = 0; k0 < args.ne00; k0 += NK) {
+        threadgroup S0 * sa = (threadgroup S0 *) (shmem + buf*SZ);
+        threadgroup S1 * sb = (threadgroup S1 *) (shmem + buf*SZ + NR0*NK*sizeof(S0));
+
+        FOR_UNROLL (short i = 0; i < 16; ++i) {
+            sa[NK*la + ka + i] = ra[i/4][i%4];
+        }
+
+        FOR_UNROLL (short j = 0; j < NB; ++j) {
+            *(threadgroup S1_2x4 *) (sb + NK*lb[j] + kb[j]) = rb[j];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (k0 + NK < args.ne00) {
+            load(k0 + NK);
+        }
+
+        tensor_a tA(sa, dextents<int32_t, 2>(NK, NR0));
+        tensor_b tB(sb, dextents<int32_t, 2>(NK, NR1));
+
+        mm.run(tB, tA, cT);
+
+        buf ^= 1;
+    }
+
+    // the tile's own extents clip the store; a slice of the whole output would take its byte offset in int32, which
+    // wraps at 2 GiB
+    device float * d = (device float *) dst + (uint64_t) im*args.ne1*args.ne0 + (uint64_t) r1*args.ne0 + r0;
+
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tD(d, dextents<int32_t, 2>(nr0, nr1), array<int, 2>({1, args.ne0}));
+
+    cT.store(tD);
+}
+
+template<
+    typename S0, typename S0_4x4, typename S0_8x8,
+    typename S1, typename S1_2x4, typename S1_8x8,
+    typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread S0_4x4 &),
     typename T0, typename T0_4x4, typename T1, typename T1_2x4>
 kernel void kernel_mul_mm(
         constant ggml_metal_kargs_mul_mm & args,
-        device const char * srcA,
-        device const char * srcB,
+        device const char * src0,
+        device const char * src1,
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig [[threadgroup_position_in_grid]],
@@ -28,122 +163,11 @@ kernel void kernel_mul_mm(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     (void) sgitg;
 
-    // Matrix dimensions: A(M,K) x B(K,N) -> C(M,N)
-    const int K = args.ne00;
-    const int M = args.ne0;
-    const int N = args.ne1;
-
-    // Batch dimension handling
-    const int im = tgpig.z;
-    const int i12 = im % FC_mul_mm_ne12;
-    const int i13 = im / FC_mul_mm_ne12;
-
-    // Batch offsets for srcA and srcB
-    const uint64_t offset0 = (i12/FC_mul_mm_r2)*args.nb02 + (i13/FC_mul_mm_r3)*args.nb03;
-
-    // Tile dimensions
-    constexpr int NRB = SZ_SIMDGROUP * N_MM_BLOCK_X * N_MM_SIMD_GROUP_X;
-    constexpr int NRA = SZ_SIMDGROUP * N_MM_BLOCK_Y * N_MM_SIMD_GROUP_Y;
-
-    // Tile offsets in output matrix
-    const int ra = tgpig.y * NRA;
-    const int rb = tgpig.x * NRB;
-
-    // Threadgroup memory for dequantized A tile only
-    threadgroup SA * sa = (threadgroup SA *)(shmem);
-
-    // Work-item count for A loading
-    constexpr int A_WORK_ITEMS = NRA * N_MM_NK;
-    constexpr int NUM_THREADS = N_SIMDWIDTH * N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y;
-
-    // tA wraps threadgroup memory
-    auto tA = tensor(sa, dextents<int32_t, 2>(N_MM_NK_TOTAL, NRA));
-
-    // tB wraps device memory directly
-    device T1 * ptrB = (device T1 *)(srcB + args.nb12*i12 + args.nb13*i13);
-    const int strideB = args.nb11 / sizeof(T1);
-    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
-
-    // Configure matmul operation
-    // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
-    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
-    // ref: https://github.com/ggml-org/llama.cpp/pull/27064
-    mpp::tensor_ops::matmul2d<
-        mpp::tensor_ops::matmul2d_descriptor(
-            NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
-            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
-
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-
-    // Accumulate partial results over K dimension
-    for (int loop_k = 0; loop_k < K; loop_k += N_MM_NK_TOTAL) {
-        // === PHASE 1: Dequantization of A into threadgroup memory ===
-        for (int work = tiitg; work < A_WORK_ITEMS; work += NUM_THREADS) {
-            const int row = work / N_MM_NK;
-            const int k_chunk = work % N_MM_NK;
-            const int k_pos = loop_k + k_chunk * 16;
-            const short k_base = k_chunk * 16;
-
-            // Bounds check: skip device read if row is out of matrix bounds
-            if (ra + row < M) {
-                if (is_same<T0_4x4, block_q>::value && FC_mul_mm_bc_inp) {
-                    // Element-wise reads when K is not aligned (nb01 not aligned for half4x4/float4x4).
-                    // MSL spec Table 2.5: half4x4 requires 8-byte alignment. When K is odd,
-                    // nb01 = K*2 is not 8-byte aligned, so odd-row pointers are misaligned.
-                    // Mirrors the legacy kernel's existing guard.
-                    device const T0 * row_ptr = (device const T0 *)(srcA + args.nb01 * (ra + row) + offset0);
-
-                    FOR_UNROLL (short i = 0; i < 16; i++) {
-                        sa[row * N_MM_NK_TOTAL + (k_base + i)] = (k_pos + i < K) ? (SA) row_ptr[k_pos + i] : (SA)0;
-                    }
-                } else {
-                    const int block_idx = k_pos / (16 * nl);
-                    const short il = (k_pos / 16) % nl;
-
-                    device const block_q * row_ptr = (device const block_q *)(srcA + args.nb01 * (ra + row) + offset0);
-
-                    SA_4x4 temp_a;
-                    dequantize_func(row_ptr + block_idx, il, temp_a);
-
-                    FOR_UNROLL (short i = 0; i < 16; i++) {
-                        // Zero-pad A for K positions beyond valid range (handles partial K iterations)
-                        sa[row * N_MM_NK_TOTAL + (k_base + i)] = (k_pos + i < K) ? temp_a[i/4][i%4] : (SA)0;
-                    }
-                }
-            } else {
-                // Zero-pad rows beyond matrix bounds
-                FOR_UNROLL (short i = 0; i < 16; i++) {
-                    sa[row * N_MM_NK_TOTAL + (k_base + i)] = (SA)0;
-                }
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // === PHASE 2: Tensor matmul ===
-        // Clamp the K extent of both operand tensors to the remaining valid K range so
-        // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
-        const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
-
-        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
-        auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
-
-        mm.run(tBv, tAv, cT);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (FC_mul_mm_nr1_64) {
+        kernel_mul_mm_tensor_impl<64, S0, S0_4x4, S1, S1_2x4, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(args, src0, src1, dst, shmem, tgpig, tiitg);
+    } else {
+        kernel_mul_mm_tensor_impl<32, S0, S0_4x4, S1, S1_2x4, block_q, nl, dequantize_func, T0, T0_4x4, T1, T1_2x4>(args, src0, src1, dst, shmem, tgpig, tiitg);
     }
-
-    // Store result tile to output matrix (with batch offset)
-    // a slice is not used because its byte offset is int32 and wraps at 2 GiB
-    // ref: https://github.com/ggml-org/llama.cpp/pull/28748
-    const int tileM = min(NRA, M - ra);
-    const int tileN = min(NRB, N - rb);
-
-    device float * dstTile = (device float *)dst + (uint64_t) im * N * M + (uint64_t) rb * M + ra;
-
-    auto tD = tensor(dstTile, dextents<int32_t, 2>(tileM, tileN), array<int, 2>({1, M}));
-    cT.store(tD);
 }
 
 #else
