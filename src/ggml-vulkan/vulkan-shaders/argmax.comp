@@ -5,8 +5,6 @@
 
 #extension GL_EXT_control_flow_attributes : enable
 
-#define FLT_MAX 3.402823466e+38F
-
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
@@ -17,6 +15,10 @@ layout (constant_id = 0) const uint BLOCK_SIZE = 32;
 shared FLOAT_TYPE tmpmax[BLOCK_SIZE];
 shared uint tmp[BLOCK_SIZE];
 
+// Each thread keeps the first of its largest values and the reduction keeps the smallest index of the largest value,
+// so that the first of equal values wins, as on the CPU, and a row with no value above -INFINITY gives 0.
+const uint NO_INDEX = 0xFFFFFFFFu;
+
 void main() {
     const uint row = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
     const uint col = gl_LocalInvocationID.x;
@@ -25,15 +27,11 @@ void main() {
         return;
     }
 
-    A_TYPE amax = -FLT_MAX;
-    uint acol = col;
+    A_TYPE amax = A_TYPE(uintBitsToFloat(0xFF800000u));
+    uint acol = NO_INDEX;
 
-    if (col < p.KX) {
-        amax = data_a[row*p.KX + col];
-    }
-
-    for (uint i = col + BLOCK_SIZE; i < p.KX; i += BLOCK_SIZE) {
-        A_TYPE val = data_a[row*p.KX + i];
+    for (uint i = col; i < p.KX; i += BLOCK_SIZE) {
+        const A_TYPE val = data_a[row*p.KX + i];
         if (val > amax) {
             amax = val;
             acol = i;
@@ -41,12 +39,12 @@ void main() {
     }
 
     tmp[col] = acol;
-    tmpmax[col] = amax;
+    tmpmax[col] = FLOAT_TYPE(amax);
 
     barrier();
     [[unroll]] for (int s = int(BLOCK_SIZE) / 2; s > 0; s >>= 1) {
-        if (col < s && col + s < p.KX) {
-            if (tmpmax[col] < tmpmax[col + s]) {
+        if (col < s) {
+            if (tmpmax[col + s] > tmpmax[col] || (tmpmax[col + s] == tmpmax[col] && tmp[col + s] < tmp[col])) {
                 tmpmax[col] = tmpmax[col + s];
                 tmp[col] = tmp[col + s];
             }
@@ -55,6 +53,6 @@ void main() {
     }
 
     if (col == 0) {
-        data_d[row] = D_TYPE(tmp[0]);
+        data_d[row] = D_TYPE(tmp[0] == NO_INDEX ? 0 : tmp[0]);
     }
 }
