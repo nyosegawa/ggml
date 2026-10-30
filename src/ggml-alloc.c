@@ -462,6 +462,8 @@ struct hash_node {
     int buffer_id;
     struct buffer_address addr;
     bool allocated;
+    // the position of the tensor in the graph: i + 1 for node i, -(i + 1) for leaf i
+    int32_t graph_pos;
 };
 
 struct tensor_alloc {
@@ -472,11 +474,16 @@ struct tensor_alloc {
 
 struct leaf_alloc {
     struct tensor_alloc leaf;
+    int32_t flags;
 };
 
+// a node's place in the graph the allocation was planned for: where it and its sources were allocated, the
+// position in the graph of each source, and its flags
 struct node_alloc {
     struct tensor_alloc dst;
     struct tensor_alloc src[GGML_MAX_SRC];
+    int32_t src_pos[GGML_MAX_SRC];
+    int32_t flags;
 };
 
 struct ggml_gallocr {
@@ -711,6 +718,21 @@ static void ggml_gallocr_free_node(ggml_gallocr_t galloc, struct ggml_tensor * n
     hn->allocated = false;
 }
 
+// the flags that change an allocation: inputs are allocated first, and outputs are never freed or reused
+static int32_t ggml_gallocr_alloc_flags(const struct ggml_tensor * t) {
+    return t->flags & (GGML_TENSOR_FLAG_INPUT | GGML_TENSOR_FLAG_OUTPUT);
+}
+
+// sets graph_pos of every node and leaf of the graph in the hash table
+static void ggml_gallocr_set_graph_pos(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    for (int i = 0; i < graph->n_nodes; i++) {
+        ggml_gallocr_hash_get(galloc, graph->nodes[i])->graph_pos = i + 1;
+    }
+    for (int i = 0; i < graph->n_leafs; i++) {
+        ggml_gallocr_hash_get(galloc, graph->leafs[i])->graph_pos = -(i + 1);
+    }
+}
+
 static int get_node_buffer_id(const int * node_buffer_ids, int i) {
     return node_buffer_ids ? node_buffer_ids[i] : 0;
 }
@@ -846,6 +868,7 @@ static bool ggml_gallocr_reserve_n_impl(
 
     // allocate in hash table
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
+    ggml_gallocr_set_graph_pos(galloc, graph);
 
     // set the node_allocs from the hash table
     if (galloc->n_nodes < graph->n_nodes) {
@@ -867,8 +890,10 @@ static bool ggml_gallocr_reserve_n_impl(
             node_alloc->dst.addr = hn->addr;
             node_alloc->dst.size_max  = ggml_backend_buft_get_alloc_size(galloc->bufts[hn->buffer_id], node);
         }
+        node_alloc->flags = ggml_gallocr_alloc_flags(node);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             struct ggml_tensor * src = node->src[j];
+            node_alloc->src_pos[j] = src ? ggml_gallocr_hash_get(galloc, src)->graph_pos : 0;
             if (!src || src->view_src || src->data) {
                 node_alloc->src[j].buffer_id = -1;
                 node_alloc->src[j].addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -890,6 +915,7 @@ static bool ggml_gallocr_reserve_n_impl(
     for (int i = 0; i < graph->n_leafs; i++) {
         struct ggml_tensor * leaf = graph->leafs[i];
         struct hash_node * hn = ggml_gallocr_hash_get(galloc, leaf);
+        galloc->leaf_allocs[i].flags = ggml_gallocr_alloc_flags(leaf);
         if (leaf->view_src || leaf->data) {
             galloc->leaf_allocs[i].leaf.buffer_id = -1;
             galloc->leaf_allocs[i].leaf.addr = GGML_BUFFER_ADDRESS_INVALID;
@@ -1021,9 +1047,41 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
         return true;
     }
 
+    // the allocation holds only for a graph wired as the one it was planned for: the same flags, and each source of
+    // each node at the same position in the graph
+    ggml_hash_set_reset(&galloc->hash_set);
+    memset(galloc->hash_values, 0, sizeof(struct hash_node) * galloc->hash_set.size);
+    ggml_gallocr_set_graph_pos(galloc, graph);
+
+    for (int i = 0; i < graph->n_leafs; i++) {
+        if (galloc->leaf_allocs[i].flags != ggml_gallocr_alloc_flags(graph->leafs[i])) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: leaf %s has other flags\n", __func__, graph->leafs[i]->name);
+#endif
+            return true;
+        }
+    }
+
     for (int i = 0; i < graph->n_nodes; i++) {
         struct ggml_tensor * node = graph->nodes[i];
         struct node_alloc * node_alloc = &galloc->node_allocs[i];
+
+        if (node_alloc->flags != ggml_gallocr_alloc_flags(node)) {
+#ifndef NDEBUG
+            GGML_LOG_DEBUG("%s: node %s has other flags\n", __func__, node->name);
+#endif
+            return true;
+        }
+
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            struct ggml_tensor * src = node->src[j];
+            if (node_alloc->src_pos[j] != (src ? ggml_gallocr_hash_get(galloc, src)->graph_pos : 0)) {
+#ifndef NDEBUG
+                GGML_LOG_DEBUG("%s: src %d of node %s is another tensor of the graph\n", __func__, j, node->name);
+#endif
+                return true;
+            }
+        }
 
         if (!ggml_gallocr_node_needs_realloc(galloc, node, &node_alloc->dst)) {
 #ifndef NDEBUG
