@@ -10202,6 +10202,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d_dw({17, 34, 9, 1}, {3, 3, 1, 9},  GGML_TYPE_F16, 1, 0, 1, true));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F16, 2, 1, 1, false));
     test_cases.emplace_back(new test_conv_2d_dw({32, 8, 64, 1}, {3, 3, 1, 64}, GGML_TYPE_F16, 2, 1, 1, true));
+    // one position per channel, which is laid out alike channel-fastest and not, with each kernel layout
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        for (bool cwhn : {false, true}) {
+            test_cases.emplace_back(new test_conv_2d_dw({1, 1, 64, 1}, {3, 3, 1, 64}, type, 1, 1, 1, cwhn));
+            test_cases.emplace_back(new test_conv_2d_dw({1, 1, 1024, 1}, {9, 9, 1, 1024}, type, 1, 4, 1, cwhn));
+        }
+    }
 
     // CONV_3D
     auto calc_conv_output_size_3d = [](int64_t ins, int64_t ks, int s, int p, int d) -> int64_t {

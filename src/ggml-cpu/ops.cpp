@@ -7968,11 +7968,12 @@ void ggml_compute_forward_conv_2d_dw(
     GGML_ASSERT(kernel->ne[3] == p.channels);
     GGML_ASSERT(dst->ne[3] == p.batch);
 
-    if (ggml_is_contiguous(src)) {
-        ggml_compute_forward_conv_2d_dw_whcn(params, src, kernel, dst, p);
-    } else if (ggml_is_contiguous_channels(src)) {
+    if (ggml_conv_2d_dw_is_cwhn(src, kernel)) {
         GGML_ASSERT(kernel->nb[0] >= kernel->nb[2] && kernel->nb[1] >= kernel->nb[0]);
         ggml_compute_forward_conv_2d_dw_cwhn(params, src, kernel, dst, p);
+    } else if (ggml_is_contiguous(src)) {
+        GGML_ASSERT(ggml_is_contiguous(kernel));
+        ggml_compute_forward_conv_2d_dw_whcn(params, src, kernel, dst, p);
     } else {
         GGML_ABORT("non-contiguous memory layout not supported");
     }

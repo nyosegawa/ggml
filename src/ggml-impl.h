@@ -104,6 +104,17 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
     return t->view_src != NULL;
 }
 
+// whether GGML_OP_CONV_2D_DW reads its input and kernel channel-fastest (CWHN) rather than WHCN; an input of one
+// position per channel is laid out alike in both, so it takes the kernel's layout, whose taps the CWHN path reads
+// channel-fastest and the WHCN path channel by channel
+static inline bool ggml_conv_2d_dw_is_cwhn(const struct ggml_tensor * input, const struct ggml_tensor * kernel) {
+    if (ggml_is_contiguous_channels(input)) {
+        return true;
+    }
+    return ggml_is_contiguous(input) && input->ne[0] * input->ne[1] == 1 &&
+           kernel->nb[0] >= kernel->nb[2] && kernel->nb[1] >= kernel->nb[0];
+}
+
 static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }

@@ -9360,16 +9360,16 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_CONV_2D_DW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            if (ggml_is_contiguous(src1)) {
-                return ctx->device->pipeline_conv2d_dw_whcn_f32;
-            } else if (ggml_is_contiguous_channels(src1)) {
+            if (ggml_conv_2d_dw_is_cwhn(src1, src0)) {
                 return ctx->device->pipeline_conv2d_dw_cwhn_f32;
+            } else if (ggml_is_contiguous(src1)) {
+                return ctx->device->pipeline_conv2d_dw_whcn_f32;
             }
         } else if (src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32) {
-            if (ggml_is_contiguous(src1)) {
-                return ctx->device->pipeline_conv2d_dw_whcn_f16_f32;
-            } else if (ggml_is_contiguous_channels(src1)) {
+            if (ggml_conv_2d_dw_is_cwhn(src1, src0)) {
                 return ctx->device->pipeline_conv2d_dw_cwhn_f16_f32;
+            } else if (ggml_is_contiguous(src1)) {
+                return ctx->device->pipeline_conv2d_dw_whcn_f16_f32;
             }
         }
         return nullptr;
