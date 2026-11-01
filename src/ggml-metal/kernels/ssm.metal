@@ -300,6 +300,89 @@ typedef decltype(kernel_ssm_scan_impl<false>) kernel_ssm_scan_t;
 template [[host_name("kernel_ssm_scan_f32")]]      kernel kernel_ssm_scan_t kernel_ssm_scan_impl<false>;
 template [[host_name("kernel_ssm_scan_f32_tail")]] kernel kernel_ssm_scan_t kernel_ssm_scan_impl<true>;
 
+// ref: ggml.c:ggml_compute_forward_ssm_scan_f32, Mamba-1 part
+// Mamba-1's decay has a value for each state element, so a row's states share nothing with another row's: one thread
+// carries the NS states of one row (a head's position of d_inner) of one sequence through every token in registers and
+// sums its output in the order the CPU does, with no barrier or reduction per token.
+template<short NS>
+kernel void kernel_ssm_scan_mamba1_impl(
+        constant ggml_metal_kargs_ssm_scan & args,
+        device const void * src0,
+        device const void * src1,
+        device const void * src2,
+        device const void * src3,
+        device const void * src4,
+        device const void * src5,
+        device const void * src6,
+        device      float * dst,
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    const int32_t nr  = args.d_inner;
+    const int32_t nh  = args.n_head;
+    const int32_t ng  = args.n_group;
+    const int32_t n_t = args.n_seq_tokens;
+
+    const int32_t row = tgpig.x*ntg.x + tpitg.x;
+    const int32_t i3  = tgpig.z; // current seq
+
+    if (row >= nh*nr) {
+        return;
+    }
+
+    const int32_t ir = row / nr; // current head
+    const int32_t i1 = row % nr;
+    const int32_t g  = ir / (nh / ng); // repeat_interleave
+
+    device const int32_t * ids = (device const int32_t *) src6;
+
+    device const float * s0 = (device const float *) ((device const char *) src0 + i1*args.nb01 + ir*args.nb02 + ids[i3]*args.nb03);
+    device       float * s  = (device       float *) ((device       char *) dst  + i1*args.nb01 + ir*args.nb02 + i3*args.nb03 + args.s_off);
+
+    device const float * A  = (device const float *) ((device const char *) src3 + ir*args.nb31);                                  // {d_state, nh}
+    device const float * x  = (device const float *) ((device const char *) src1 + i1*args.nb10 + ir*args.nb11 + i3*args.nb13); // {dim, nh, nt, ns}
+    device const float * dt = (device const float *) ((device const char *) src2 + ir*args.nb20 + i3*args.nb22);                 // {nh, nt, ns}
+    device const float * B  = (device const float *) ((device const char *) src4 + g*args.nb41 + i3*args.nb43);                  // {d_state, ng, nt, ns}
+    device const float * C  = (device const float *) ((device const char *) src5 + g*args.nb51 + i3*args.nb53);                  // {d_state, ng, nt, ns}
+
+    device float * y = dst + (i1 + ir*nr + i3*(n_t*nh*nr)); // {dim, nh, nt, ns}
+
+    float state[NS];
+    float a[NS];
+
+    FOR_UNROLL (short j = 0; j < NS; ++j) {
+        state[j] = s0[j];
+        a[j]     = A[j];
+    }
+
+    for (int32_t i2 = 0; i2 < n_t; ++i2) {
+        const float dt0  = dt[0];
+        const float dtsp = dt0 <= 20.0f ? log(1.0f + exp(dt0)) : dt0;
+        const float x_dt = x[0] * dtsp;
+
+        float sumf = 0.0f;
+        FOR_UNROLL (short j = 0; j < NS; ++j) {
+            state[j] = (state[j] * exp(dtsp * a[j])) + (B[j] * x_dt);
+            sumf += state[j] * C[j];
+        }
+        y[0] = sumf;
+
+        x  += args.ns12;
+        dt += args.ns21;
+        B  += args.ns42;
+        C  += args.ns52;
+        y  += nh*nr;
+    }
+
+    FOR_UNROLL (short j = 0; j < NS; ++j) {
+        s[j] = state[j];
+    }
+}
+
+typedef decltype(kernel_ssm_scan_mamba1_impl<16>) kernel_ssm_scan_mamba1_t;
+
+template [[host_name("kernel_ssm_scan_mamba1_f32_16")]] kernel kernel_ssm_scan_mamba1_t kernel_ssm_scan_mamba1_impl<16>;
+
 // Chunked SSD SSM scan via Metal simdgroup MMatrix Multiply-Accumulate (simdgroup_float8x8) fast path.
 // One threadgroup per (head, sequence) and tokens are processed in chunks.
 // C*B^T computed in each chunk one time and reused across the head_dim channel tiles.
