@@ -956,7 +956,10 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     const int16_t r2   = (int16_t) (ne12 / op->src[0]->ne[2]);
     const int16_t r3   = (int16_t) (ne13 / op->src[0]->ne[3]);
 
-    snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
+    // src1 prec [TAG_GGML_PREC]: F32 by F32 whose src1 asks for F32 is staged in float, the rest in two bytes
+    const bool f32_operands = tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 && ggml_get_op_params_i32(op, 3) == GGML_PREC_F32;
+
+    snprintf(base, 256, "kernel_mul_mm_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), f32_operands ? "_f32" : "");
     snprintf(name, 256, "%s_bci=%d_bco=%d_nr1=%d_ne12=%d_ne13=%d_r2=%d_r3=%d",
              base, bc_inp, bc_out, nr1, ne12, ne13, r2, r3);
 
@@ -981,11 +984,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     res.nr1 = nr1;
     res.nsg = 4;
 
+    // the size of a staged operand
+    const size_t ts = f32_operands ? sizeof(float) : sizeof(ggml_fp16_t);
+
     if (has_tensor) {
         // two buffers of the operands of a step
-        res.smem = 2*(64 + nr1)*32*sizeof(ggml_fp16_t);
+        res.smem = 2*(64 + nr1)*32*ts;
     } else {
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        // the operands of a step, or the 64x32 floats of an output tile that ends inside it
+        res.smem = std::max<size_t>((64 + 32)*32*ts, bc_out ? 64*32*sizeof(float) : 0);
     }
 
     return res;

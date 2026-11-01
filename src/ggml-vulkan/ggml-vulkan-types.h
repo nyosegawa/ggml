@@ -259,10 +259,12 @@ struct vk_matmul_pipeline_key {
     ggml_type type_b;
     bool mul_mat_id;
     bool f16acc;
+    // F32 by F32 whose operands stay in float, for a product whose src1 asks for GGML_PREC_F32
+    bool f32_operands = false;
 
     bool operator<(const vk_matmul_pipeline_key & o) const {
-        return std::tie(type_a, type_b, mul_mat_id, f16acc)
-             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc);
+        return std::tie(type_a, type_b, mul_mat_id, f16acc, f32_operands)
+             < std::tie(o.type_a, o.type_b, o.mul_mat_id, o.f16acc, o.f32_operands);
     }
 };
 
