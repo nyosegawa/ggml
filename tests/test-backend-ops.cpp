@@ -10613,6 +10613,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rms_norm    (GGML_TYPE_F32, {4, 1, 1, 65536}, false, 1e-6f, false));
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
+    // more rows than 512 and no multiple of it, which Vulkan dispatches 512 to a row of workgroups: 513 rows in one and
+    // in three dimensions, and the 40411 rows of SEMamba's LayerNorm at 16 kHz
+    for (std::array<int64_t, 4> ne : {std::array<int64_t, 4>{64, 513, 1, 1}, {64, 3, 9, 19}, {64, 40411, 1, 1}}) {
+        test_cases.emplace_back(new test_norm        (GGML_TYPE_F32, ne, false, 1e-5f));
+        test_cases.emplace_back(new test_rms_norm_back(GGML_TYPE_F32, ne, 1e-5f));
+        test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, ne, 1e-12f));
+        test_cases.emplace_back(new test_sum_rows    (GGML_TYPE_F32, ne));
+        test_cases.emplace_back(new test_mean        (GGML_TYPE_F32, ne));
+        test_cases.emplace_back(new test_cumsum      (GGML_TYPE_F32, ne));
+    }
 
     for (ggml_type set_rows_type : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
         test_cases.emplace_back(new test_rms_norm_mul_rope({ 256, 1, 1, 1 }, 1e-6f, false, true, false, GGML_ROPE_TYPE_NORMAL, false, false, set_rows_type));
