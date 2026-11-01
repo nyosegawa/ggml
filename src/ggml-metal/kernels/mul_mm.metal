@@ -14,13 +14,14 @@ constant bool FC_mul_mm_nr1_64 [[function_constant(FC_MUL_MM + 8)]];
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
 // A threadgroup multiplies 64 rows of src0 by NR1 rows of src1 on the matrix units of Metal's tensor API, 32 columns a
-// step. Each step's operands are staged in threadgroup memory in S0 and S1 (half, or bfloat for BF16), as the simdgroup
-// kernel stages them, and the units multiply them without relaxed precision: they then sum the exact products of the
-// staged values in float, so that the result is the simdgroup kernel's up to the order of the sums. With relaxed
-// precision, given float activations, an Apple M5 computes less precisely: on speech.cpp's products (2026-10-15) the
-// result lies 2e-7 to 3e-7 in NMSE from the exact product of the operands rounded to half, where this kernel's lies
-// 5e-15 to 5e-13 and the simdgroup kernel's 1e-14 to 2e-12. The next step's operands are read from device memory while
-// the units multiply the current step's, into the other of two buffers, so that a step waits at one barrier.
+// step. Each step's operands are staged in threadgroup memory in S0 and S1 (float for F32, bfloat for BF16, half
+// otherwise), as the simdgroup kernel stages them, and the units multiply them without relaxed precision: they then sum
+// the exact products of the staged values in float, so that the result is the simdgroup kernel's up to the order of the
+// sums. With relaxed precision, given float activations, an Apple M5 computes less precisely: on speech.cpp's products
+// (2026-10-15) the result lies 2e-7 to 3e-7 in NMSE from the exact product of the operands rounded to half, where this
+// kernel's lies 5e-15 to 5e-13 and the simdgroup kernel's 1e-14 to 2e-12. The next step's operands are read from device
+// memory while the units multiply the current step's, into the other of two buffers, so that a step waits at one
+// barrier.
 template<
     short NR1,
     typename S0, typename S0_4x4, typename S1, typename S1_2x4,
@@ -187,13 +188,13 @@ kernel void kernel_mul_mm(
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
-    threadgroup S1 * sb = (threadgroup S1 *)(shmem + 4096);
-
     constexpr int NR0 = 64;
     constexpr int NR1 = 32;
 
     constexpr int NK  = 32;
+
+    threadgroup S0 * sa = (threadgroup S0 *)(shmem);
+    threadgroup S1 * sb = (threadgroup S1 *)(shmem + NR0*NK*sizeof(S0));
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
@@ -974,7 +975,9 @@ kernel void kernel_mul_mm_id(
 
 typedef decltype(kernel_mul_mm<half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, float4x4, 1, dequantize_f32, float, float4x4, float, float2x4>) mul_mm_t;
 
-template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
+// F32 weights are multiplied in float: half would round them and their activations to 11 bits and turn a value past
+// 65504 into inf, where the CPU's product is finite
+template [[host_name("kernel_mul_mm_f32_f32")]]     kernel mul_mm_t kernel_mul_mm<float,  float4x4,  simdgroup_float8x8,  float,  float2x4,  simdgroup_float8x8,  float4x4,      1,     dequantize_f32,     float,  float4x4,  float, float2x4>;
 template [[host_name("kernel_mul_mm_f16_f32")]]     kernel mul_mm_t kernel_mul_mm<half,   half4x4,   simdgroup_half8x8,   half,   half2x4,   simdgroup_half8x8,   half4x4,       1,     dequantize_f16,     half,   half4x4,   float, float2x4>;
 #if defined(GGML_METAL_HAS_BF16)
 template [[host_name("kernel_mul_mm_bf16_f32")]]    kernel mul_mm_t kernel_mul_mm<bfloat, bfloat4x4, simdgroup_bfloat8x8, bfloat, bfloat2x4, simdgroup_bfloat8x8, bfloat4x4,     1,     dequantize_bf16,    bfloat, bfloat4x4, float, float2x4>;

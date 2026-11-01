@@ -9698,6 +9698,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_large_b(type, 64, n, k, 0.5f, 1.0f, 512.0f, 1024.0f));
         }
     }
+    // F32 by F32 with values past half precision that float holds, in the activations or in the weights: SEMamba's
+    // output projections (64 outputs of 128 inputs at 151*81 and 251*161 positions), and the mat-mat kernel's tiles of
+    // 32 and of 64 columns
+    test_cases.emplace_back(new test_mul_mat_large_b(GGML_TYPE_F32, 64, 151*81, 128, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
+    test_cases.emplace_back(new test_mul_mat_large_b(GGML_TYPE_F32, 64, 251*161, 128, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
+    test_cases.emplace_back(new test_mul_mat_large_b(GGML_TYPE_F32, 129, 77, 1000, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
+    test_cases.emplace_back(new test_mul_mat_large_b(GGML_TYPE_F32, 129, 77, 1000, 6.6e4f, 7.2e4f, -1.0f, 1.0f));
+    test_cases.emplace_back(new test_mul_mat_large_b(GGML_TYPE_F32, 1024, 192, 288, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
     // Metal's kernel_mul_mm on the tensor API's matrix units, in every weight type speech.cpp ships, with its tiles of 32
     // and of 64 columns: outputs whose rows and columns end inside a tile, K that does not fill the last step of a tile,
     // broadcast batches, permuted and strided activations, and activations in half precision
@@ -12390,6 +12398,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
     }
+
+    // F32 by F32: SEMamba's output projections and a square product
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 151*81, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 64, 251*161, 128, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1024, 1024, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {

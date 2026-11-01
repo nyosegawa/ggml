@@ -981,11 +981,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
     res.nr1 = nr1;
     res.nsg = 4;
 
+    // the kernel stages the operands of an F32 src0 in float and the others in a type of two bytes
+    const size_t ts = tsrc0 == GGML_TYPE_F32 ? sizeof(float) : sizeof(ggml_fp16_t);
+
     if (has_tensor) {
         // two buffers of the operands of a step
-        res.smem = 2*(64 + nr1)*32*sizeof(ggml_fp16_t);
+        res.smem = 2*(64 + nr1)*32*ts;
     } else {
-        res.smem = bc_out ? 8192 : (4096 + 2048);
+        // the operands of a step, or the 64x32 floats of an output tile that ends inside it
+        res.smem = std::max<size_t>((64 + 32)*32*ts, bc_out ? 64*32*sizeof(float) : 0);
     }
 
     return res;
