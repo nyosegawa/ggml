@@ -6851,6 +6851,33 @@ struct test_conv_2d : public test_case {
     }
 };
 
+// GGML_OP_CONV_2D of an F32 kernel with values in the input or the kernel past what half precision holds
+struct test_conv_2d_large : public test_conv_2d {
+    const float input_min, input_max, kernel_min, kernel_max;
+
+    std::string vars() override {
+        return test_conv_2d::vars() + "," + VARS_TO_STR4(input_min, input_max, kernel_min, kernel_max);
+    }
+
+    test_conv_2d_large(std::array<int64_t, 4> ne_input, std::array<int64_t, 4> ne_kernel, int stride0, int stride1,
+                       int padding0, int padding1, int dilation0, int dilation1,
+                       float input_min, float input_max, float kernel_min, float kernel_max)
+        : test_conv_2d(ne_input, ne_kernel, GGML_TYPE_F32, stride0, stride1, padding0, padding1, dilation0, dilation1),
+          input_min(input_min), input_max(input_max), kernel_min(kernel_min), kernel_max(kernel_max) {}
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "input") == 0) {
+                init_tensor_uniform(t, input_min, input_max);
+            } else if (strcmp(t->name, "kernel") == 0) {
+                init_tensor_uniform(t, kernel_min, kernel_max);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_IM2COL + GGML_OP_MUL_MAT
 // the im2col of a BF16 kernel is F32, which puts F32 in src0 and BF16 in src1 of the mul_mat
 struct test_conv_1d_dw : public test_case {
@@ -10206,6 +10233,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d({ 19, 17, 16, 3 }, { 3, 3, 16, 33 }, GGML_TYPE_F16, 2, 3, 4, 2, 2, 1));
     test_cases.emplace_back(new test_conv_2d({ 13, 11, 16, 3 }, { 1, 1, 16, 33 }, GGML_TYPE_F16, 1, 1, 0, 0, 1, 1));
     test_cases.emplace_back(new test_conv_2d({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, GGML_TYPE_F16, 1, 1, 1, 1, 1, 1, false, 1));
+    // An F32 kernel with values past half precision that float holds, in the input or in the kernel: a dense layer of
+    // SEMamba, whose activations reach 7.07e4, and a small convolution that a tile of any shape covers
+    test_cases.emplace_back(new test_conv_2d_large({ 323, 403, 64, 1 }, { 3, 3, 64, 64 }, 1, 1, 1, 1, 1, 1, 6.6e4f, 7.2e4f, -1.0f, 1.0f));
+    test_cases.emplace_back(new test_conv_2d_large({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, 1, 1, 1, 1, 1, 1, 6.6e4f, 7.2e4f, -1.0f, 1.0f));
+    test_cases.emplace_back(new test_conv_2d_large({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, 1, 1, 1, 1, 1, 1, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)

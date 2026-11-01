@@ -3789,12 +3789,6 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         vk_conv_block_size conv2d_BS = vk_conv_block_sizes[s];
         bool conv2d_UNROLL = true;
 
-#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
-        if (device->coopmat2) {
-            conv2d_SHMEM_PAD = 8; // 8 float16_t
-        }
-#endif
-
         if (device->vendor_id == VK_VENDOR_ID_INTEL) {
             conv2d_SHMEM_PAD = 0;
             conv2d_UNROLL = false;
@@ -3804,6 +3798,13 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
                 conv2d_UNROLL = false;
             }
         }
+        // the scalar shader's padding, which an F32 kernel takes on every device (below)
+        const uint32_t conv2d_scalar_SHMEM_PAD = conv2d_SHMEM_PAD;
+#if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
+        if (device->coopmat2 && device->vendor_id != VK_VENDOR_ID_INTEL && device->vendor_id != VK_VENDOR_ID_AMD) {
+            conv2d_SHMEM_PAD = 8; // 8 float16_t
+        }
+#endif
 
         // Use collectives on pre-Turing NVIDIA GPUs and GCN AMD cards, which had slower integer math.
         bool allow_collectives_nv = device->vendor_id != VK_VENDOR_ID_NVIDIA ||
@@ -3841,6 +3842,16 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             const uint32_t csh_elems = csh_store ? conv2d_BS.K * conv2d_BS.NPQ : 0u;
             return (conv2d_BS.K * (conv2d_BS.CRS + pad) + conv2d_BS.CRS * (conv2d_BS.NPQ + pad) + csh_elems) * elem_size;
         };
+
+        // An F32 kernel runs in the scalar shader on every device, both operands staged in float as the CPU computes
+        // them: the cooperative matrix shaders stage them in half precision, which loses values past 65504 and 13 bits
+        // of every operand. It takes the tiles of a device without cooperative matrices.
+        uint32_t conv2d_scalar_CRS = conv2d_BS.CRS;
+        if (device->properties.limits.maxComputeSharedMemorySize < shmem_req(conv2d_scalar_SHMEM_PAD, false, false)) {
+            conv2d_scalar_CRS = use_collectives ? std::min(device->subgroup_size, 8u) : 8u;
+        }
+        const std::vector<uint32_t> conv2d_scalar_spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_scalar_CRS, conv2d_BS.NPQ, conv2d_TS_K, use_collectives, conv2d_scalar_SHMEM_PAD };
+        const std::vector<uint32_t> conv3d_scalar_spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_scalar_CRS, conv2d_BS.NPQ, conv2d_TS_K, conv2d_scalar_SHMEM_PAD };
 
         // 2D, transpose-2D, and 3D conv use the same KxCRS @ CRSxNPQ shmem
         // layout. cm1 needs Csh for output, so check before applying cm1 params.
@@ -3892,10 +3903,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         // cm1 needs a fixed subgroup width to match the WG_SIZE we computed
         const uint32_t conv2d_required_subgroup_size = conv2d_use_cm1 ? device->subgroup_size : 0;
 
-#define CREATE_CONV(name, type_suffix, spv_suffix) \
+#define CREATE_CONV(name, type_suffix, spv_suffix, spec, csh_store, subgroup_size) \
         for (auto &c : device->pipeline_##name##type_suffix[s]) { \
             const vk_conv2d_pipeline_state &state = c.first;  \
-            std::vector<uint32_t> spec_constants_cpy = spec_constants; \
+            std::vector<uint32_t> spec_constants_cpy = spec; \
             spec_constants_cpy.push_back(state.s0); \
             spec_constants_cpy.push_back(state.s1); \
             spec_constants_cpy.push_back(state.p0); \
@@ -3905,42 +3916,49 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             spec_constants_cpy.push_back(state.KW); \
             spec_constants_cpy.push_back(state.KH); \
             spec_constants_cpy.push_back(state.aligned); \
-            spec_constants_cpy.push_back(conv2d_csh_store); \
+            spec_constants_cpy.push_back(csh_store); \
             spec_constants_cpy.push_back(conv2d_WM); \
             spec_constants_cpy.push_back(conv2d_WN); \
             ggml_vk_create_pipeline( \
                 device, c.second, #name #type_suffix, \
                 name##type_suffix##spv_suffix##_len, name##type_suffix##spv_suffix##_data, "main", 3, \
-                sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives || conv2d_required_subgroup_size, conv2d_required_subgroup_size);    \
+                sizeof(vk_op_conv2d_push_constants), wg_denoms, spec_constants_cpy, 1, true, use_collectives || subgroup_size, subgroup_size);    \
         }
-#define CREATE_CONVS(spv_suffix) \
-        CREATE_CONV(conv2d, _f32, spv_suffix) \
-        CREATE_CONV(conv2d, _f16_f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix) \
-        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix)
+#define CREATE_CONVS_F16(spv_suffix) \
+        CREATE_CONV(conv2d, _f16_f32, spv_suffix, spec_constants, conv2d_csh_store, conv2d_required_subgroup_size) \
+        CREATE_CONV(conv_transpose_2d, _f16_f32, spv_suffix, spec_constants, conv2d_csh_store, conv2d_required_subgroup_size)
+#define CREATE_CONVS_F32(spv_suffix) \
+        CREATE_CONV(conv2d, _f32, spv_suffix, conv2d_scalar_spec_constants, 0u, 0u) \
+        CREATE_CONV(conv_transpose_2d, _f32, spv_suffix, conv2d_scalar_spec_constants, 0u, 0u)
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (device->coopmat2) {
-            CREATE_CONVS(_cm2)
+            CREATE_CONVS_F16(_cm2)
         } else
 #endif
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (conv2d_use_cm1) {
-            CREATE_CONVS(_cm1)
+            CREATE_CONVS_F16(_cm1)
         } else
 #endif
         if (conv2d_UNROLL) {
-            CREATE_CONVS(_unroll)
+            CREATE_CONVS_F16(_unroll)
         } else {
-            CREATE_CONVS( )
+            CREATE_CONVS_F16( )
+        }
+        if (conv2d_UNROLL) {
+            CREATE_CONVS_F32(_unroll)
+        } else {
+            CREATE_CONVS_F32( )
         }
 #undef CREATE_CONV
-#undef CREATE_CONVS
+#undef CREATE_CONVS_F16
+#undef CREATE_CONVS_F32
 
         std::vector<uint32_t> conv3d_spec_constants = { conv2d_WG_SIZE, conv2d_BS.K, conv2d_BS.CRS, conv2d_BS.NPQ, conv2d_TS_K, conv2d_SHMEM_PAD };
-#define CREATE_CONV3D(type_suffix, spv_suffix) \
+#define CREATE_CONV3D(type_suffix, spv_suffix, spec, csh_store, subgroup_size) \
         for (auto &c : device->pipeline_conv3d##type_suffix[s]) { \
             const vk_conv3d_pipeline_state &state = c.first; \
-            std::vector<uint32_t> spec_constants_cpy = conv3d_spec_constants; \
+            std::vector<uint32_t> spec_constants_cpy = spec; \
             spec_constants_cpy.push_back(state.s0); \
             spec_constants_cpy.push_back(state.s1); \
             spec_constants_cpy.push_back(state.s2); \
@@ -3954,32 +3972,33 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             spec_constants_cpy.push_back(state.KH); \
             spec_constants_cpy.push_back(state.KD); \
             spec_constants_cpy.push_back(state.aligned); \
-            spec_constants_cpy.push_back(conv2d_csh_store); \
+            spec_constants_cpy.push_back(csh_store); \
             spec_constants_cpy.push_back(conv2d_WM); \
             spec_constants_cpy.push_back(conv2d_WN); \
             ggml_vk_create_pipeline( \
                 device, c.second, "conv3d" #type_suffix, \
                 conv3d##type_suffix##spv_suffix##_len, conv3d##type_suffix##spv_suffix##_data, "main", 3, \
-                sizeof(vk_op_conv3d_push_constants), wg_denoms, spec_constants_cpy, 1, true, conv2d_required_subgroup_size != 0, conv2d_required_subgroup_size); \
+                sizeof(vk_op_conv3d_push_constants), wg_denoms, spec_constants_cpy, 1, true, subgroup_size != 0, subgroup_size); \
         }
 #if defined(GGML_VULKAN_COOPMAT2_GLSLC_SUPPORT)
         if (device->coopmat2) {
-            CREATE_CONV3D(_f32, _cm2)
-            CREATE_CONV3D(_f16_f32, _cm2)
+            CREATE_CONV3D(_f16_f32, _cm2, conv3d_spec_constants, conv2d_csh_store, conv2d_required_subgroup_size)
         } else
 #endif
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
         if (conv2d_use_cm1) {
-            CREATE_CONV3D(_f32, _cm1)
-            CREATE_CONV3D(_f16_f32, _cm1)
+            CREATE_CONV3D(_f16_f32, _cm1, conv3d_spec_constants, conv2d_csh_store, conv2d_required_subgroup_size)
         } else
 #endif
         if (conv2d_UNROLL) {
-            CREATE_CONV3D(_f32, _unroll)
-            CREATE_CONV3D(_f16_f32, _unroll)
+            CREATE_CONV3D(_f16_f32, _unroll, conv3d_spec_constants, conv2d_csh_store, conv2d_required_subgroup_size)
         } else {
-            CREATE_CONV3D(_f32, )
-            CREATE_CONV3D(_f16_f32, )
+            CREATE_CONV3D(_f16_f32, , conv3d_spec_constants, conv2d_csh_store, conv2d_required_subgroup_size)
+        }
+        if (conv2d_UNROLL) {
+            CREATE_CONV3D(_f32, _unroll, conv3d_scalar_spec_constants, 0u, 0u)
+        } else {
+            CREATE_CONV3D(_f32, , conv3d_scalar_spec_constants, 0u, 0u)
         }
 #undef CREATE_CONV3D
     }
