@@ -10725,6 +10725,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
+    // Mamba-1 of SEMamba's blocks (d_inner 256), over time and over frequency at 16 and 48 kHz, and channels that do not
+    // fill a workgroup
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 251, 161));
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 251, 481));
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 161, 251));
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 481, 251));
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 100, 1, 5, 3));
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 16, 8, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // d_state=96 SSD multi-chunk (partial 2nd chunk, 2 seqs)
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 96, 64, 16, 8, 8, 2, /*K=*/3)); // d_state=96 rollback snapshots match prefix states
@@ -12648,6 +12655,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 251, 161)); // SEMamba over time, 16 kHz
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 161, 251)); // SEMamba over frequency, 16 kHz
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 251, 481)); // SEMamba over time, 48 kHz
+    test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 256, 1, 481, 251)); // SEMamba over frequency, 48 kHz
 
     // acc
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));
