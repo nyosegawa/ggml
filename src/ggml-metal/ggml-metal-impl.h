@@ -959,6 +959,19 @@ typedef struct {
 } ggml_metal_kargs_ssm_scan;
 
 typedef struct {
+    int32_t  d_inner;
+    int32_t  n_t;
+    int32_t  n_s;
+    int32_t  dt_rank;
+    int32_t  n_dbc;
+    int32_t  reverse;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb1;
+    uint64_t nb2;
+} ggml_metal_kargs_mamba1;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;

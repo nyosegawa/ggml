@@ -3770,6 +3770,10 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size, 16}, 1, true, true);
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
+    if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
+        // a workgroup of 256 channels, 16 states and a convolution of 4, the sizes supports_op takes
+        ggml_vk_create_pipeline(device, device->pipeline_mamba1_f32, "mamba1_f32", mamba1_f32_len, mamba1_f32_data, "main", 9, sizeof(vk_op_mamba1_push_constants), {1, 1, 1}, {256, 16, 4}, 1, false, true);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,           "ssm_conv_f32",           ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 0}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32,      "ssm_conv_silu_f32",      ssm_conv_f32_len, ssm_conv_f32_data, "main", 4, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16, 0, 1}, 1);
@@ -9316,6 +9320,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
+    case GGML_OP_MAMBA1:
+        if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+            return ctx->device->pipeline_mamba1_f32;
+        }
+        return nullptr;
     case GGML_OP_SSM_SCAN:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t d_state = src0->ne[0];
@@ -10485,6 +10494,33 @@ void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_te
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], src_buf[6], dst_buf},
         pc, elements);
+}
+
+void ggml_vk_mamba1(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    GGML_ASSERT(dst->buffer != nullptr);
+
+    vk_pipeline pipeline = ctx->device->pipeline_mamba1_f32;
+    GGML_ASSERT(pipeline != nullptr);
+
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    const ggml_tensor * xz = dst->src[0];
+    const vk_op_mamba1_push_constants pc = {
+        (uint32_t) dst->ne[1], (uint32_t) dst->src[4]->ne[0], (uint32_t) dst->src[3]->ne[1], (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) (xz->nb[1] / sizeof(float)), (uint32_t) (xz->nb[2] / sizeof(float)),
+        (uint32_t) (dst->nb[1] / sizeof(float)), (uint32_t) (dst->nb[2] / sizeof(float)),
+    };
+
+    vk_subbuffer buf[9];
+    for (int i = 0; i < 8; i++) {
+        buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+    buf[8] = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    // a workgroup for each sequence
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]},
+        pc, { (uint32_t) dst->ne[2], 1, 1 });
 }
 
 void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, const struct ggml_cgraph * cgraph, int node_idx) {
@@ -12906,6 +12942,11 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
 
     case GGML_OP_SSM_SCAN:
         ggml_vk_ssm_scan(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_MAMBA1:
+        ggml_vk_mamba1(ctx, compute_ctx, node);
 
         break;
 
@@ -16109,6 +16150,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 }
                 return op->type == GGML_TYPE_F32;
             }
+        case GGML_OP_MAMBA1:
+            // the pipeline's sizes: 256 channels, 16 states, a convolution of 4, up to 8 ranks of dt and 64 of x_proj
+            return device->pipeline_mamba1_f32 != nullptr && op->ne[0] == 256 && op->src[6]->ne[0] == 16 &&
+                op->src[1]->ne[0] == 4 && op->src[4]->ne[0] <= 8 && op->src[3]->ne[1] <= 64 && op->src[0]->nb[0] == sizeof(float);
         case GGML_OP_SSM_SCAN:
             {
                 for (int i = 0; i < 6; i++) {

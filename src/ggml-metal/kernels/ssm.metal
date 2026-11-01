@@ -474,3 +474,170 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+// Mamba-1 from its in_proj output to the gated output before out_proj, as ggml.c:ggml_compute_forward_mamba1_f32
+// computes it: a threadgroup for each sequence and a thread for each channel, which keeps the channel's conv history and
+// its NS states in registers through every step. The steps go TB = 8 at a time: each thread convolves its channel over
+// them, the conv outputs meet in threadgroup memory, where the simdgroups multiply them by x_proj's first 32 rows in 8x8
+// blocks, each block's channels split among nsg/4 simdgroups, and sum its other rows as dot products, and each thread
+// then scans its channel through the block's steps.
+constant constexpr short MAMBA1_TB = 8;
+
+template<short NS, short NC>
+kernel void kernel_mamba1_impl(
+        constant ggml_metal_kargs_mamba1 & args,
+        device const char  * xz,
+        device const float * conv_w,
+        device const float * conv_b,
+        device const float * x_proj,
+        device const float * dt_proj,
+        device const float * dt_b,
+        device const float * A,
+        device const float * D,
+        device       char  * dst,
+        threadgroup  float * shared [[threadgroup(0)]],
+        uint   tgpig[[threadgroup_position_in_grid]],
+        ushort tpitg[[thread_position_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort ntg  [[threads_per_threadgroup]]) {
+    constexpr short TB = MAMBA1_TB;
+
+    const int c  = tpitg;
+    const int s  = tgpig;
+    const int di = args.d_inner;
+    const int nr = args.dt_rank;
+    const int nd = args.n_dbc;
+
+    // the conv outputs of a block's steps [TB][d_inner], their dt, B and C [TB][n_dbc], and the partial products of x_proj's
+    // first 32 rows [nsg/4][TB][32]
+    threadgroup float * xs   = shared;
+    threadgroup float * dbc  = shared + TB*di;
+    threadgroup float * part = dbc + TB*nd;
+
+    float w[NC];
+    for (short k = 0; k < NC; ++k) {
+        w[k] = conv_w[c*NC + k];
+    }
+    float a[NS];
+    for (short i = 0; i < NS; ++i) {
+        a[i] = A[c*NS + i];
+    }
+    float dtp[8];
+    for (short r = 0; r < nr; ++r) {
+        dtp[r] = dt_proj[c*nr + r];
+    }
+    const float cb = conv_b[c];
+    const float db = dt_b[c];
+    const float dd = D[c];
+
+    float hist[NC > 1 ? NC - 1 : 1];
+    for (short k = 0; k < NC - 1; ++k) {
+        hist[k] = 0.0f;
+    }
+    float h[NS];
+    for (short i = 0; i < NS; ++i) {
+        h[i] = 0.0f;
+    }
+
+    const short nsg = ntg / 32;
+
+    for (int b0 = 0; b0 < args.n_t; b0 += TB) {
+        const short nb = min((int) TB, args.n_t - b0);
+
+        float xcs[TB];
+        float zs[TB];
+        for (short b = 0; b < nb; ++b) {
+            const int t = args.reverse ? args.n_t - 1 - (b0 + b) : b0 + b;
+            device const float * x = (device const float *) (xz + t*args.nb01 + s*args.nb02);
+            const float xv = x[c];
+            zs[b] = x[di + c];
+
+            float sumf = 0.0f;
+            for (short k = 0; k < NC - 1; ++k) {
+                sumf += hist[k] * w[k];
+            }
+            sumf += xv * w[NC - 1];
+            for (short k = 0; k + 1 < NC - 1; ++k) {
+                hist[k] = hist[k + 1];
+            }
+            if (NC > 1) {
+                hist[NC - 2] = xv;
+            }
+            const float v = sumf + cb;
+            xcs[b] = v / (1.0f + exp(-v));
+            xs[b*di + c] = xcs[b];
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Rows of xs past nb hold an earlier block's values, or none; their products are not read.
+        {
+            const short jb    = sgitg % 4;
+            const short kp    = sgitg / 4;
+            const short np    = nsg / 4;
+            const int   kblk  = di / 8 / np;
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            for (int kb = kp*kblk; kb < (kp + 1)*kblk; ++kb) {
+                simdgroup_float8x8 mx;
+                simdgroup_float8x8 mw;
+                simdgroup_load(mx, xs + kb*8, di);
+                simdgroup_load(mw, x_proj + jb*8*di + kb*8, di, 0, true);
+                simdgroup_multiply_accumulate(acc, mx, mw, acc);
+            }
+            simdgroup_store(acc, part + kp*TB*32 + jb*8, 32);
+        }
+        for (int e = sgitg; e < nb*(nd - 32); e += nsg) {
+            const int b = e / (nd - 32);
+            const int j = 32 + e % (nd - 32);
+            device const float * row = x_proj + j*di;
+            threadgroup const float * xb = xs + b*di;
+            float sum = 0.0f;
+            for (int i = tiisg; i < di; i += 32) {
+                sum += row[i] * xb[i];
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                dbc[b*nd + j] = sum;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int e = tpitg; e < nb*32; e += ntg) {
+            float sum = 0.0f;
+            for (short k = 0; k < nsg / 4; ++k) {
+                sum += part[k*TB*32 + e];
+            }
+            dbc[(e / 32)*nd + e % 32] = sum;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short b = 0; b < nb; ++b) {
+            const int t = args.reverse ? args.n_t - 1 - (b0 + b) : b0 + b;
+            threadgroup const float * d = dbc + b*nd;
+            float dt = db;
+            for (short r = 0; r < nr; ++r) {
+                dt += dtp[r] * d[r];
+            }
+            const float dt_soft_plus = dt <= 20.0f ? log(1.0f + exp(dt)) : dt;
+            const float x_dt = xcs[b] * dt_soft_plus;
+            threadgroup const float * B = d + nr;
+            threadgroup const float * C = B + NS;
+            float y = 0.0f;
+            for (short i = 0; i < NS; ++i) {
+                const float state = h[i] * exp(dt_soft_plus * a[i]) + B[i] * x_dt;
+                y += state * C[i];
+                h[i] = state;
+            }
+            y += dd * xcs[b];
+            device float * out = (device float *) (dst + t*args.nb1 + s*args.nb2);
+            out[c] = y * zs[b] / (1.0f + exp(-zs[b]));
+        }
+    }
+}
+
+typedef decltype(kernel_mamba1_impl<16, 4>) kernel_mamba1_t;
+
+template [[host_name("kernel_mamba1_f32_16_4")]] kernel kernel_mamba1_t kernel_mamba1_impl<16, 4>;

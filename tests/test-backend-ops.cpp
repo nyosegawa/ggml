@@ -4811,6 +4811,66 @@ struct test_ssm_scan_rollback : public test_case {
 };
 
 // GGML_OP_SSM_SCAN + GGML_OP_CPY (recurrent cache fusion)
+// GGML_OP_MAMBA1
+struct test_mamba1 : public test_case {
+    const int64_t d_inner;
+    const int64_t d_state;
+    const int64_t d_conv;
+    const int64_t dt_rank;
+    const int64_t n_t;
+    const int64_t n_s;
+    const bool    reverse;
+
+    std::string vars() override {
+        return VARS_TO_STR7(d_inner, d_state, d_conv, dt_rank, n_t, n_s, reverse);
+    }
+
+    test_mamba1(int64_t d_inner = 256, int64_t d_state = 16, int64_t d_conv = 4, int64_t dt_rank = 4,
+            int64_t n_t = 32, int64_t n_s = 4, bool reverse = false)
+        : d_inner(d_inner), d_state(d_state), d_conv(d_conv), dt_rank(dt_rank), n_t(n_t), n_s(n_s), reverse(reverse) {}
+
+    double max_nmse_err() override {
+        // the states add up a step's rounding over every later step
+        return 1e-6;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        const int64_t n_dbc = dt_rank + 2 * d_state;
+        // the convolution, x_proj, dt_proj, the scan and the output of each channel at each step
+        return (uint64_t) n_t * n_s * d_inner * (2 * d_conv + 2 * n_dbc + 2 * dt_rank + 6 * d_state + 4);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_dbc = dt_rank + 2 * d_state;
+        ggml_tensor * xz      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 2 * d_inner, n_t, n_s);
+        ggml_tensor * conv_w  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * conv_b  = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_tensor * x_proj  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_dbc);
+        ggml_tensor * dt_proj = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, dt_rank, d_inner);
+        ggml_tensor * dt_b    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_tensor * A       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_state, d_inner);
+        ggml_tensor * D       = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d_inner);
+        ggml_set_name(x_proj, "x_proj");
+        ggml_set_name(A, "A");
+        return ggml_mamba1(ctx, xz, conv_w, conv_b, x_proj, dt_proj, dt_b, A, D, reverse);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "A") == 0) {
+                // a decay, as -exp(A_log) gives it
+                init_tensor_uniform(t, -4.0f, -0.25f);
+            } else if (strcmp(t->name, "x_proj") == 0) {
+                // a projection whose sums over the channels stay near the other inputs' range
+                init_tensor_uniform(t, -0.125f, 0.125f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 struct test_ssm_scan_cache_fusion : public test_case {
     const ggml_type type;
 
@@ -10776,6 +10836,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
+    // Mamba-1 of SEMamba's blocks (d_inner 256, 16 states, a convolution of 4, a dt of rank 4) over time and over
+    // frequency at 16 and 48 kHz, each way; sequences shorter than a block of steps; and wider and narrower channels
+    for (bool reverse : { false, true }) {
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 251, 161, reverse));
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 161, 251, reverse));
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 251, 481, reverse));
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 481, 251, reverse));
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 5, 3, reverse));
+        test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 1, 1, reverse));
+        test_cases.emplace_back(new test_mamba1(128, 16, 4, 8, 37, 2, reverse));
+        test_cases.emplace_back(new test_mamba1(512, 16, 4, 2, 19, 3, reverse));
+    }
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 16, 8, 300, 2, false, /*K=*/1, /*weak_decay=*/true)); // d_state=96 SSD multi-chunk (partial 2nd chunk, 2 seqs)
     test_cases.emplace_back(new test_ssm_scan_rollback(GGML_TYPE_F32, 96, 64, 16, 8, 8, 2, /*K=*/3)); // d_state=96 rollback snapshots match prefix states
@@ -12699,6 +12771,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 64, 48, 1, 1,   1)); // generate
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 512, 1)); // Nemotron-9B prefill
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 128, 80, 128, 1, 1,   1)); // Nemotron-9B generate
+    test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 251, 161, false)); // SEMamba over time, 16 kHz
+    test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 161, 251, true));  // SEMamba over frequency, 16 kHz
+    test_cases.emplace_back(new test_mamba1(256, 16, 4, 4, 481, 251, false)); // SEMamba over frequency, 48 kHz
 
     // acc
     test_cases.emplace_back(new test_acc(GGML_TYPE_F32, {256, 17, 1, 1}, {256, 16, 1, 1}, -1));

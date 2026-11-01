@@ -1082,6 +1082,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_BACK",
     "SSM_CONV",
     "SSM_SCAN",
+    "MAMBA1",
     "WIN_PART",
     "WIN_UNPART",
     "GET_REL_POS",
@@ -1112,7 +1113,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1197,6 +1198,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_back(x)",
     "ssm_conv(x)",
     "ssm_scan(x)",
+    "mamba1(xz)",
     "win_part(x)",
     "win_unpart(x)",
     "get_rel_pos(x)",
@@ -1227,7 +1229,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5771,6 +5773,52 @@ struct ggml_tensor * ggml_ssm_scan(
     result->src[6] = ids;
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
+
+    return result;
+}
+
+// ggml_mamba1
+
+struct ggml_tensor * ggml_mamba1(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * xz,
+        struct ggml_tensor  * conv_w,
+        struct ggml_tensor  * conv_b,
+        struct ggml_tensor  * x_proj,
+        struct ggml_tensor  * dt_proj,
+        struct ggml_tensor  * dt_b,
+        struct ggml_tensor  * A,
+        struct ggml_tensor  * D,
+        bool                  reverse) {
+    GGML_ASSERT(ggml_is_3d(xz) && ggml_is_contiguous(xz) && xz->type == GGML_TYPE_F32);
+    const int64_t d_inner = xz->ne[0] / 2;
+    const int64_t d_conv  = conv_w->ne[0];
+    const int64_t d_state = A->ne[0];
+    const int64_t dt_rank = dt_proj->ne[0];
+    GGML_ASSERT(xz->ne[0] == 2 * d_inner);
+    GGML_ASSERT(ggml_is_matrix(conv_w) && conv_w->ne[1] == d_inner && d_conv >= 1);
+    GGML_ASSERT(ggml_nelements(conv_b) == d_inner && ggml_nelements(dt_b) == d_inner && ggml_nelements(D) == d_inner);
+    GGML_ASSERT(ggml_is_matrix(x_proj) && x_proj->ne[0] == d_inner && x_proj->ne[1] == dt_rank + 2 * d_state);
+    GGML_ASSERT(ggml_is_matrix(dt_proj) && dt_proj->ne[1] == d_inner);
+    GGML_ASSERT(ggml_is_matrix(A) && A->ne[1] == d_inner);
+    struct ggml_tensor * srcs[] = { conv_w, conv_b, x_proj, dt_proj, dt_b, A, D };
+    for (size_t i = 0; i < sizeof(srcs) / sizeof(srcs[0]); i++) {
+        GGML_ASSERT(srcs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous(srcs[i]));
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_inner, xz->ne[1], xz->ne[2]);
+
+    ggml_set_op_params_i32(result, 0, reverse ? 1 : 0);
+
+    result->op     = GGML_OP_MAMBA1;
+    result->src[0] = xz;
+    result->src[1] = conv_w;
+    result->src[2] = conv_b;
+    result->src[3] = x_proj;
+    result->src[4] = dt_proj;
+    result->src[5] = dt_b;
+    result->src[6] = A;
+    result->src[7] = D;
 
     return result;
 }

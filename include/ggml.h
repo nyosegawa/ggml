@@ -572,6 +572,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
+        GGML_OP_MAMBA1,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
         GGML_OP_GET_REL_POS,
@@ -2541,6 +2542,24 @@ extern "C" {
             struct ggml_tensor  * C,
             struct ggml_tensor  * ids,
             int64_t               K);
+
+    // Mamba-1 from its in_proj output to the gated output before out_proj, as mamba-ssm's causal_conv1d (with silu)
+    // and selective_scan (with delta_bias, delta_softplus, D and z) compute it: xz [2*d_inner, n_t, n_s] holds x and
+    // then z; conv_w [d_conv, d_inner] and conv_b [d_inner]; x_proj [d_inner, dt_rank + 2*d_state]; dt_proj [dt_rank,
+    // d_inner] and dt_b [d_inner]; A [d_state, d_inner]; D [d_inner]. Each sequence starts from zero history and state,
+    // and with reverse its steps run from the last to the first, the output staying at each step's own position.
+    // result: y [d_inner, n_t, n_s]
+    GGML_API struct ggml_tensor * ggml_mamba1(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * xz,
+            struct ggml_tensor  * conv_w,
+            struct ggml_tensor  * conv_b,
+            struct ggml_tensor  * x_proj,
+            struct ggml_tensor  * dt_proj,
+            struct ggml_tensor  * dt_b,
+            struct ggml_tensor  * A,
+            struct ggml_tensor  * D,
+            bool                  reverse);
 
     // partition into non-overlapping windows with padding if needed
     // example:

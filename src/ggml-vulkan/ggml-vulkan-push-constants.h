@@ -716,6 +716,11 @@ struct vk_op_ssm_scan_push_constants {
     uint32_t n_seq, K;
 };
 
+struct vk_op_mamba1_push_constants {
+    uint32_t n_t, dt_rank, n_dbc, reverse;
+    uint32_t xz_nb1, xz_nb2, d_nb1, d_nb2;
+};
+
 struct vk_op_ssm_conv_push_constants {
     uint32_t nb01, nb02;
     uint32_t nb11;

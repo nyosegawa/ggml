@@ -363,6 +363,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_ssm_scan(ctx, idx);
             } break;
+        case GGML_OP_MAMBA1:
+            {
+                n_fuse = ggml_metal_op_mamba1(ctx, idx);
+            } break;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             {
@@ -1747,6 +1751,44 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
     }
 
     return n_fuse;
+}
+
+int ggml_metal_op_mamba1(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const int32_t d_inner = (int32_t) op->ne[0];
+    const int32_t n_dbc   = (int32_t) op->src[3]->ne[1];
+
+    ggml_metal_kargs_mamba1 args = {
+        /*.d_inner =*/ d_inner,
+        /*.n_t     =*/ (int32_t) op->ne[1],
+        /*.n_s     =*/ (int32_t) op->ne[2],
+        /*.dt_rank =*/ (int32_t) op->src[4]->ne[0],
+        /*.n_dbc   =*/ n_dbc,
+        /*.reverse =*/ ggml_get_op_params_i32(op, 0),
+        /*.nb01    =*/ op->src[0]->nb[1],
+        /*.nb02    =*/ op->src[0]->nb[2],
+        /*.nb1     =*/ op->nb[1],
+        /*.nb2     =*/ op->nb[2],
+    };
+
+    ggml_metal_pipeline_with_params pipeline = ggml_metal_library_get_pipeline_mamba1(lib, op);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    for (int i = 0; i < 8; ++i) {
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[i]), i + 1);
+    }
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 9);
+    // the conv outputs and the dt, B and C of a block of 8 steps (MAMBA1_TB in ssm.metal), and the partial products of
+    // x_proj's first 32 rows of each quarter of the simdgroups
+    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD((8*(d_inner + n_dbc) + (d_inner/32/4)*8*32)*sizeof(float), 16), 0);
+    ggml_metal_encoder_dispatch_threadgroups(enc, (int) op->ne[2], 1, 1, d_inner, 1, 1);
+
+    return 1;
 }
 
 int ggml_metal_op_ssm_scan(ggml_metal_op_t ctx, int idx) {

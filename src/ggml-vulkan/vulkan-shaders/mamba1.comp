@@ -1,0 +1,147 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Mamba-1 from its in_proj output to the gated output before out_proj, as ggml-cpu's ggml_compute_forward_mamba1_f32
+// computes it: a workgroup for each sequence and an invocation for each channel, which keeps the channel's conv history
+// and its D_STATE states in registers through every step. The steps go TB at a time: each invocation convolves its
+// channel over them, the conv outputs meet in shared memory, where each subgroup sums some of x_proj's rows over every
+// channel for each step, and each invocation then scans its channel through the block's steps.
+
+layout(constant_id = 0) const uint D_INNER = 256;
+layout(constant_id = 1) const uint D_STATE = 16;
+layout(constant_id = 2) const uint D_CONV = 4;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly buffer XZ { float xz[]; };
+layout(binding = 1) readonly buffer ConvW { float conv_w[]; };
+layout(binding = 2) readonly buffer ConvB { float conv_b[]; };
+layout(binding = 3) readonly buffer XProj { float x_proj[]; };
+layout(binding = 4) readonly buffer DtProj { float dt_proj[]; };
+layout(binding = 5) readonly buffer DtB { float dt_b[]; };
+layout(binding = 6) readonly buffer AS { float A[]; };
+layout(binding = 7) readonly buffer DS { float D[]; };
+layout(binding = 8) writeonly buffer Dst { float d[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint n_t;
+    uint dt_rank;
+    uint n_dbc;
+    uint reverse;
+    uint xz_nb1;
+    uint xz_nb2;
+    uint d_nb1;
+    uint d_nb2;
+};
+
+const uint TB = 8;
+const uint MAX_RANK = 8;
+const uint MAX_DBC = 64;
+
+shared float xs[TB * D_INNER];
+shared float dbc[TB * MAX_DBC];
+
+void main() {
+    const uint c = gl_LocalInvocationID.x;
+    const uint s = gl_WorkGroupID.x;
+
+    float w[D_CONV];
+    [[unroll]] for (uint k = 0; k < D_CONV; k++) {
+        w[k] = conv_w[c * D_CONV + k];
+    }
+    float a[D_STATE];
+    [[unroll]] for (uint i = 0; i < D_STATE; i++) {
+        a[i] = A[c * D_STATE + i];
+    }
+    float dtp[MAX_RANK];
+    [[unroll]] for (uint r = 0; r < MAX_RANK; r++) {
+        dtp[r] = r < dt_rank ? dt_proj[c * dt_rank + r] : 0.0f;
+    }
+    const float cb = conv_b[c];
+    const float db = dt_b[c];
+    const float dd = D[c];
+
+    float hist[D_CONV];
+    [[unroll]] for (uint k = 0; k < D_CONV; k++) {
+        hist[k] = 0.0f;
+    }
+    float h[D_STATE];
+    [[unroll]] for (uint i = 0; i < D_STATE; i++) {
+        h[i] = 0.0f;
+    }
+
+    const uint nsg = D_INNER / gl_SubgroupSize;
+
+    for (uint b0 = 0; b0 < n_t; b0 += TB) {
+        const uint nb = min(TB, n_t - b0);
+
+        float xcs[TB];
+        float zs[TB];
+        [[unroll]] for (uint b = 0; b < TB; b++) {
+            if (b >= nb) {
+                break;
+            }
+            const uint t = reverse != 0 ? n_t - 1 - (b0 + b) : b0 + b;
+            const uint base = t * xz_nb1 + s * xz_nb2;
+            const float xv = xz[base + c];
+            zs[b] = xz[base + D_INNER + c];
+
+            float sumf = 0.0f;
+            [[unroll]] for (uint k = 0; k + 1 < D_CONV; k++) {
+                sumf += hist[k] * w[k];
+            }
+            sumf += xv * w[D_CONV - 1];
+            [[unroll]] for (uint k = 0; k + 2 < D_CONV; k++) {
+                hist[k] = hist[k + 1];
+            }
+            hist[D_CONV - 2] = xv;
+            const float v = sumf + cb;
+            xcs[b] = v / (1.0f + exp(-v));
+            xs[b * D_INNER + c] = xcs[b];
+        }
+
+        barrier();
+
+        for (uint e = gl_SubgroupID; e < nb * n_dbc; e += nsg) {
+            const uint b = e / n_dbc;
+            const uint j = e % n_dbc;
+            float part = 0.0f;
+            for (uint i = gl_SubgroupInvocationID; i < D_INNER; i += gl_SubgroupSize) {
+                part += x_proj[j * D_INNER + i] * xs[b * D_INNER + i];
+            }
+            part = subgroupAdd(part);
+            if (gl_SubgroupInvocationID == 0) {
+                dbc[b * n_dbc + j] = part;
+            }
+        }
+
+        barrier();
+
+        [[unroll]] for (uint b = 0; b < TB; b++) {
+            if (b >= nb) {
+                break;
+            }
+            const uint t = reverse != 0 ? n_t - 1 - (b0 + b) : b0 + b;
+            const uint o = b * n_dbc;
+            float dt = db;
+            [[unroll]] for (uint r = 0; r < MAX_RANK; r++) {
+                if (r < dt_rank) {
+                    dt += dtp[r] * dbc[o + r];
+                }
+            }
+            const float dt_soft_plus = dt <= 20.0f ? log(1.0f + exp(dt)) : dt;
+            const float x_dt = xcs[b] * dt_soft_plus;
+            float y = 0.0f;
+            [[unroll]] for (uint i = 0; i < D_STATE; i++) {
+                const float state = h[i] * exp(dt_soft_plus * a[i]) + dbc[o + dt_rank + i] * x_dt;
+                y += state * dbc[o + dt_rank + D_STATE + i];
+                h[i] = state;
+            }
+            y += dd * xcs[b];
+            d[t * d_nb1 + s * d_nb2 + c] = y * zs[b] / (1.0f + exp(-zs[b]));
+        }
+    }
+}

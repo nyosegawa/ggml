@@ -10315,6 +10315,131 @@ void ggml_compute_forward_ssm_scan(
     }
 }
 
+// ggml_compute_forward_mamba1
+
+static void ggml_compute_forward_mamba1_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * xz      = dst->src[0];
+    const ggml_tensor * conv_w  = dst->src[1];
+    const ggml_tensor * conv_b  = dst->src[2];
+    const ggml_tensor * x_proj  = dst->src[3];
+    const ggml_tensor * dt_proj = dst->src[4];
+    const ggml_tensor * dt_b    = dst->src[5];
+    const ggml_tensor * A       = dst->src[6];
+    const ggml_tensor * D       = dst->src[7];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t d_inner = dst->ne[0];
+    const int64_t n_t     = dst->ne[1];
+    const int64_t n_s     = dst->ne[2];
+    const int64_t d_conv  = conv_w->ne[0];
+    const int64_t d_state = A->ne[0];
+    const int64_t dt_rank = dt_proj->ne[0];
+    const int64_t n_dbc   = x_proj->ne[1];
+    const bool reverse    = ggml_get_op_params_i32(dst, 0) != 0;
+
+    const float * w   = (const float *) conv_w->data;
+    const float * cb  = (const float *) conv_b->data;
+    const float * xp  = (const float *) x_proj->data;
+    const float * dtp = (const float *) dt_proj->data;
+    const float * dtb = (const float *) dt_b->data;
+    const float * a   = (const float *) A->data;
+    const float * d   = (const float *) D->data;
+
+    // The thread's scratch: the last d_conv - 1 inputs of each channel, oldest first, the step's conv outputs, dt and
+    // gates, the states of each channel, the step's exp(dt A) and the step's dt (low rank), B and C.
+    const int64_t per_thread = d_inner*(d_conv - 1) + 3*d_inner + 2*d_inner*d_state + n_dbc + CACHE_LINE_SIZE_F32;
+    float * hist = (float *) params->wdata + per_thread*ith;
+    float * xc   = hist + d_inner*(d_conv - 1);
+    float * dts  = xc + d_inner;
+    float * gate = dts + d_inner;
+    float * h    = gate + d_inner;
+    float * da   = h + d_inner*d_state;
+    float * dbc  = da + d_inner*d_state;
+
+    // The threads take the sequences one at a time as they finish, so that the slower cores of a hybrid CPU take fewer.
+    if (ith == 0) {
+        ggml_threadpool_chunk_set(params->threadpool, nth);
+    }
+    ggml_barrier(params->threadpool);
+
+    for (int64_t s = ith; s < n_s; s = ggml_threadpool_chunk_add(params->threadpool, 1)) {
+        memset(hist, 0, sizeof(float)*d_inner*(d_conv - 1));
+        memset(h, 0, sizeof(float)*d_inner*d_state);
+        for (int64_t step = 0; step < n_t; ++step) {
+            const int64_t t = reverse ? n_t - 1 - step : step;
+            const float * x = (const float *) ((const char *) xz->data + t*xz->nb[1] + s*xz->nb[2]);
+            const float * z = x + d_inner;
+            float * y = (float *) ((char *) dst->data + t*dst->nb[1] + s*dst->nb[2]);
+
+            // The causal depthwise convolution over the steps taken, then silu.
+            for (int64_t c = 0; c < d_inner; ++c) {
+                float sumf = 0.0f;
+                for (int64_t k = 0; k < d_conv - 1; ++k) {
+                    sumf += hist[k*d_inner + c] * w[c*d_conv + k];
+                }
+                sumf += x[c] * w[c*d_conv + d_conv - 1];
+                for (int64_t k = 0; k + 1 < d_conv - 1; ++k) {
+                    hist[k*d_inner + c] = hist[(k + 1)*d_inner + c];
+                }
+                if (d_conv > 1) {
+                    hist[(d_conv - 2)*d_inner + c] = x[c];
+                }
+                xc[c] = sumf + cb[c];
+            }
+            ggml_vec_silu_f32((int) d_inner, xc, xc);
+            ggml_vec_silu_f32((int) d_inner, gate, z);
+            // x_proj: the step's low-rank dt, B and C from every channel.
+            for (int64_t j = 0; j < n_dbc; ++j) {
+                ggml_vec_dot_f32((int) d_inner, dbc + j, 0, xp + j*d_inner, 0, xc, 0, 1);
+            }
+            const float * B = dbc + dt_rank;
+            const float * C = B + d_state;
+            for (int64_t c = 0; c < d_inner; ++c) {
+                float dt = dtb[c];
+                for (int64_t r = 0; r < dt_rank; ++r) {
+                    dt += dtp[c*dt_rank + r] * dbc[r];
+                }
+                dts[c] = dt <= 20.0f ? log1pf(expf(dt)) : dt;
+                for (int64_t i = 0; i < d_state; ++i) {
+                    da[c*d_state + i] = dts[c] * a[c*d_state + i];
+                }
+            }
+            // A softmax's exponentials less a maximum of 0 are exp(dt A), with the SIMD exp of each architecture.
+            ggml_vec_soft_max_f32((int) (d_inner*d_state), da, da, 0.0f);
+            for (int64_t c = 0; c < d_inner; ++c) {
+                const float x_dt = xc[c] * dts[c];
+                float * hc = h + c*d_state;
+                const float * dac = da + c*d_state;
+                for (int64_t i = 0; i < d_state; ++i) {
+                    hc[i] = hc[i] * dac[i] + B[i] * x_dt;
+                }
+                float sumf;
+                ggml_vec_dot_f32((int) d_state, &sumf, 0, hc, 0, C, 0, 1);
+                y[c] = (sumf + d[c] * xc[c]) * gate[c];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_mamba1(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_mamba1_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_win_part
 
 static void ggml_compute_forward_win_part_f32(

@@ -1838,6 +1838,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction;
         case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
+        case GGML_OP_MAMBA1:
+            // the kernels of 16 states and a convolution of 4, a thread to a channel of a threadgroup, whose simdgroups
+            // multiply x_proj's first 32 rows by quarters
+            return has_simdgroup_reduction && has_simdgroup_mm && op->src[6]->ne[0] == 16 && op->src[1]->ne[0] == 4 &&
+                op->src[4]->ne[0] <= 8 && op->src[3]->ne[1] >= 32 && op->ne[0] % 128 == 0 && op->ne[0] <= 1024;
         case GGML_OP_RWKV_WKV6:
         case GGML_OP_RWKV_WKV7:
             return true;

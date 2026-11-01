@@ -2045,6 +2045,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_ssm_scan(params, tensor);
             } break;
+        case GGML_OP_MAMBA1:
+            {
+                ggml_compute_forward_mamba1(params, tensor);
+            } break;
         case GGML_OP_WIN_PART:
             {
                 ggml_compute_forward_win_part(params, tensor);
@@ -2429,6 +2433,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_FLASH_ATTN_BACK:
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
+        case GGML_OP_MAMBA1:
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 n_tasks = n_threads;
@@ -3021,6 +3026,17 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_CROSS_ENTROPY_LOSS:
                     {
                         cur = ggml_type_size(node->type)*(n_tasks + node->src[0]->ne[0]*n_tasks);
+                    } break;
+                case GGML_OP_MAMBA1:
+                    {
+                        // Each thread's conv history, the step's conv outputs, dt and gates, its states, the step's
+                        // exp(dt A) and its dt, B and C, a cache line apart.
+                        const int64_t d_inner = node->ne[0];
+                        const int64_t d_conv  = node->src[1]->ne[0];
+                        const int64_t d_state = node->src[6]->ne[0];
+                        const int64_t n_dbc   = node->src[3]->ne[1];
+                        const int64_t per_thread = d_inner*(d_conv - 1) + 3*d_inner + 2*d_inner*d_state + n_dbc + CACHE_LINE_SIZE_F32;
+                        cur = sizeof(float)*per_thread*n_tasks;
                     } break;
                 case GGML_OP_GATED_DELTA_NET:
                     {
