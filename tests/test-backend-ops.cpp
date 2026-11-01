@@ -10298,6 +10298,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_conv_2d_large({ 323, 403, 64, 1 }, { 3, 3, 64, 64 }, 1, 1, 1, 1, 1, 1, 6.6e4f, 7.2e4f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_conv_2d_large({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, 1, 1, 1, 1, 1, 1, 6.6e4f, 7.2e4f, -1.0f, 1.0f));
     test_cases.emplace_back(new test_conv_2d_large({ 19, 17, 8, 2 }, { 3, 3, 8, 17 }, 1, 1, 1, 1, 1, 1, -1.0f, 1.0f, 6.6e4f, 7.2e4f));
+    // SEMamba's convolutions on 2 s of 16 kHz audio: the encoder's first, the dense layers' first and last (dilated 8
+    // frames), the encoder's strided last, and a decoder's up-sampling
+    test_cases.emplace_back(new test_conv_2d({ 323, 403, 2, 1 }, { 1, 1, 2, 64 }, GGML_TYPE_F32, 1, 1, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 323, 403, 64, 1 }, { 3, 3, 64, 64 }, GGML_TYPE_F32, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 323, 403, 256, 1 }, { 3, 3, 256, 64 }, GGML_TYPE_F32, 1, 1, 1, 8, 1, 8));
+    test_cases.emplace_back(new test_conv_2d({ 323, 403, 64, 1 }, { 3, 1, 64, 64 }, GGML_TYPE_F32, 2, 4, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 161, 101, 64, 1 }, { 3, 1, 64, 128 }, GGML_TYPE_F32, 1, 1, 1, 0, 1, 1));
 
     // sycl backend will limit task global_range < MAX_INT
     // test cases for 2D im2col with large input W and H (occurs in stable-diffusion)
@@ -12395,6 +12402,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 kernel_type, 1, 1, 0, 0, 1, 1, true));    // bool cwhn = true
         }
     }
+
+    // SEMamba's convolutions on a chunk of 5 s of 16 kHz audio
+    test_cases.emplace_back(new test_conv_2d({ 323, 1003, 2, 1 }, { 1, 1, 2, 64 }, GGML_TYPE_F32, 1, 1, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 323, 1003, 64, 1 }, { 3, 3, 64, 64 }, GGML_TYPE_F32, 1, 1, 1, 1, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 323, 1003, 256, 1 }, { 3, 3, 256, 64 }, GGML_TYPE_F32, 1, 1, 1, 8, 1, 8));
+    test_cases.emplace_back(new test_conv_2d({ 323, 1003, 64, 1 }, { 3, 1, 64, 64 }, GGML_TYPE_F32, 2, 4, 0, 0, 1, 1));
+    test_cases.emplace_back(new test_conv_2d({ 161, 251, 64, 1 }, { 3, 1, 64, 128 }, GGML_TYPE_F32, 1, 1, 1, 0, 1, 1));
 
     struct conv3d_perf_case {
         int N, IC, ID, IH, IW, OC, KD, KH, KW, s0, s1, s2, p0, p1, p2, d0, d1, d2;

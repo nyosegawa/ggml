@@ -4815,6 +4815,22 @@ int ggml_metal_op_conv_2d(ggml_metal_op_t ctx, int idx) {
         /*.d1   =*/ d1,
     };
 
+    // An F32 kernel into a contiguous output runs as an implicit GEMM, a tile of 64 positions by 64 output channels to a
+    // threadgroup, whose two tiles of 32 rows of K, or its output tile, take 16 KiB.
+    if (op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op)) {
+        auto pipeline = ggml_metal_library_get_pipeline_conv_2d_mm(lib, op);
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, 64*64*sizeof(float), 0);
+        ggml_metal_encoder_dispatch_threadgroups(enc, (ne0*ne1 + 63)/64, (ne03 + 63)/64, ne3, 128, 1, 1);
+
+        return 1;
+    }
+
     auto pipeline = ggml_metal_library_get_pipeline_conv_2d(lib, op);
 
     int nth = ggml_metal_pipeline_max_theads_per_threadgroup(pipeline);

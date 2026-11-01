@@ -252,6 +252,198 @@ kernel void kernel_conv_2d(
     }
 }
 
+// CONV_2D of an F32 kernel as an implicit GEMM: the output [OC, OW*OH] of each image is the kernel [OC, IC*KH*KW]
+// times the input's patches [IC*KH*KW, OW*OH], gathered tile by tile as they are multiplied. A threadgroup of four
+// simdgroups computes a tile of 64 positions by 64 output channels, 32 rows of K a step, staging both operands in float.
+// With whole steps of input channels, K runs over the kernel's taps and then the channels, so that a step's patch is one
+// pixel of 32 channels and needs no division. Offsets are counted in floats, in 32 bits, which the GPU multiplies in
+// one instruction where it takes several for 64.
+constant constexpr int CONV_MM_NP_T = 64;
+constant constexpr int CONV_MM_OC_T = 64;
+constant constexpr int CONV_MM_NK   = 32;
+constant constexpr int CONV_MM_NT   = 128;
+
+struct conv_2d_mm_loader {
+
+    constant ggml_metal_kargs_conv_2d & args;
+    device const float * weights;
+    device const float * src_n;
+    int K, NP, p0, m0;
+    int w0, w1, w2, w3, x0, x1, x2;
+    // the thread's position of the tile, at the rows kr, kr + 2, ... of each step's 32, and its output channel, at the
+    // columns kw .. kw + 15
+    int pl, kr, ow, oh, wm, kw;
+    bool pin, win, by_tap;
+
+    // Writes the step from k0 of the patches into sp [NP_T][NK] and of the kernel into sw [OC_T][NK], both with K
+    // fastest, zeros past the tensors.
+    void load(int k0, threadgroup float * sp, threadgroup float * sw) const {
+        constexpr int NP_T = CONV_MM_NP_T;
+        constexpr int NK   = CONV_MM_NK;
+        constexpr int NT   = CONV_MM_NT;
+        if (by_tap) {
+            const int tap = k0 / args.IC;
+            const int ic0 = k0 % args.IC;
+            const int ky  = tap / args.KW;
+            const int kx  = tap % args.KW;
+            const int  ix = ow*args.s0 - args.p0 + kx*args.d0;
+            const int  iy = oh*args.s1 - args.p1 + ky*args.d1;
+            const bool ok = pin && ix >= 0 && ix < args.IW && iy >= 0 && iy < args.IH;
+            device const float * px = src_n + ic0*x2 + (ok ? iy : 0)*x1 + (ok ? ix : 0)*x0;
+            for (int kk = kr; kk < NK; kk += NT / NP_T) {
+                sp[pl*NK + kk] = ok ? px[kk*x2] : 0.0f;
+            }
+            device const float * wr = weights + (m0 + wm)*w3 + ic0*w2 + ky*w1 + kx*w0;
+            for (int kk = kw; kk < kw + 16; ++kk) {
+                sw[wm*NK + kk] = win ? wr[kk*w2] : 0.0f;
+            }
+        } else {
+            for (int kk = kr; kk < NK; kk += NT / NP_T) {
+                const int k = k0 + kk;
+                float v = 0.0f;
+                if (k < K && pin) {
+                    const int kx = k % args.KW;
+                    const int t  = k / args.KW;
+                    const int ky = t % args.KH;
+                    const int ic = t / args.KH;
+                    const int ix = ow*args.s0 - args.p0 + kx*args.d0;
+                    const int iy = oh*args.s1 - args.p1 + ky*args.d1;
+                    if (ix >= 0 && ix < args.IW && iy >= 0 && iy < args.IH) {
+                        v = src_n[ic*x2 + iy*x1 + ix*x0];
+                    }
+                }
+                sp[pl*NK + kk] = v;
+            }
+            for (int kk = kw; kk < kw + 16; ++kk) {
+                const int k = k0 + kk;
+                float v = 0.0f;
+                if (win && k < K) {
+                    const int kx = k % args.KW;
+                    const int t  = k / args.KW;
+                    v = weights[(m0 + wm)*w3 + (t / args.KH)*w2 + (t % args.KH)*w1 + kx*w0];
+                }
+                sw[wm*NK + kk] = v;
+            }
+        }
+    }
+};
+
+kernel void kernel_conv_2d_mm_f32_f32(
+        constant ggml_metal_kargs_conv_2d & args,
+        device const float * weights,
+        device const float * src,
+        device       float * dst,
+        threadgroup  float * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr int NP_T = CONV_MM_NP_T;
+    constexpr int OC_T = CONV_MM_OC_T;
+    constexpr int NK   = CONV_MM_NK;
+
+    const int NP = args.OW*args.OH;
+    const int p0 = tgpig.x*NP_T;
+    const int m0 = tgpig.y*OC_T;
+    const int pl = tiitg % NP_T;
+    const int p  = p0 + pl;
+
+    const conv_2d_mm_loader ld = {
+        args, weights, src + (uint64_t) tgpig.z*(args.nb13/4),
+        args.IC*args.KH*args.KW, NP, p0, m0,
+        (int) (args.nb00/4), (int) (args.nb01/4), (int) (args.nb02/4), (int) (args.nb03/4),
+        (int) (args.nb10/4), (int) (args.nb11/4), (int) (args.nb12/4),
+        pl, (int) tiitg / NP_T, p < NP ? p % args.OW : 0, p < NP ? p / args.OW : 0, (int) tiitg / 2, 16*((int) tiitg % 2),
+        p < NP, m0 + (int) tiitg / 2 < args.OC, args.IC % NK == 0,
+    };
+
+    threadgroup float * sp = shmem;
+    threadgroup float * sw = shmem + NP_T*NK;
+
+    device float * dst_n = dst + (uint64_t) tgpig.z*(args.nb3/4);
+
+#ifdef GGML_METAL_HAS_TENSOR
+    // The units compute the tile [OC_T][NP_T] from the patches' and the kernel's rows, as kernel_mul_mm_tensor_impl
+    // multiplies src0's rows by src1's; the output is contiguous, its channels a row of NP positions apart.
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(OC_T, NP_T, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+
+    using tensor_t = tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline>;
+
+    auto cT = mm.template get_destination_cooperative_tensor<tensor_t, tensor_t, float>();
+    for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+        cT[i] = 0.0f;
+    }
+
+    for (int k0 = 0; k0 < ld.K; k0 += NK) {
+        ld.load(k0, sp, sw);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        tensor_t tP(sp, dextents<int32_t, 2>(NK, NP_T));
+        tensor_t tW(sw, dextents<int32_t, 2>(NK, OC_T));
+        mm.run(tW, tP, cT);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const int np = min(NP - p0, NP_T);
+    const int nm = min(args.OC - m0, OC_T);
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tD(dst_n + (uint64_t) m0*(args.nb2/4) + p0, dextents<int32_t, 2>(np, nm),
+                                                                 array<int, 2>({1, (int) (args.nb2/4)}));
+    cT.store(tD);
+#else
+    // Four simdgroups, each 32 positions by 32 channels in 8x8 blocks; the tile goes through threadgroup memory, so that
+    // the edges of the output are written within its bounds.
+    const short sg_p = sgitg % 2;
+    const short sg_m = sgitg / 2;
+
+    simdgroup_float8x8 acc[4][4];
+    for (short i = 0; i < 4; ++i) {
+        for (short j = 0; j < 4; ++j) {
+            acc[i][j] = make_filled_simdgroup_matrix<float, 8>(0.0f);
+        }
+    }
+
+    for (int k0 = 0; k0 < ld.K; k0 += NK) {
+        ld.load(k0, sp, sw);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (short kk = 0; kk < NK; kk += 8) {
+            simdgroup_float8x8 a[4];
+            simdgroup_float8x8 b[4];
+            for (short i = 0; i < 4; ++i) {
+                simdgroup_load(a[i], sw + (sg_m*32 + i*8)*NK + kk, NK);
+            }
+            for (short j = 0; j < 4; ++j) {
+                simdgroup_load(b[j], sp + (sg_p*32 + j*8)*NK + kk, NK, 0, true);
+            }
+            for (short i = 0; i < 4; ++i) {
+                for (short j = 0; j < 4; ++j) {
+                    simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float * tile = shmem;
+    for (short i = 0; i < 4; ++i) {
+        for (short j = 0; j < 4; ++j) {
+            simdgroup_store(acc[i][j], tile + (sg_m*32 + i*8)*NP_T + sg_p*32 + j*8, NP_T);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int i = tiitg; i < OC_T*NP_T; i += CONV_MM_NT) {
+        const int m  = m0 + i / NP_T;
+        const int pp = p0 + i % NP_T;
+        if (m < args.OC && pp < NP) {
+            dst_n[m*(int) (args.nb2/4) + (pp / args.OW)*(int) (args.nb1/4) + (pp % args.OW)*(int) (args.nb0/4)] = tile[i];
+        }
+    }
+#endif
+}
+
 template [[host_name("kernel_conv_2d_f32_f32")]]
 kernel void kernel_conv_2d<float>(
         constant ggml_metal_kargs_conv_2d & args,
