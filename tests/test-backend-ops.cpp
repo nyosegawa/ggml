@@ -9838,6 +9838,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 1024, 128, 288, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F16, 129, 65, 83, {2, 1}, {1, 1}));
     }
+    // Metal's kernel_mul_mm on K from 32 to 63, which Haru's codec multiplies at its 32 channels over a frame's 3200
+    // samples: F32, F16, BF16 and Q8_0 weights (Q8_0's K of 32 is one block), outputs and columns that end inside a tile,
+    // broadcast batches and permuted activations
+    for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0}) {
+        for (int64_t k : {32, 33, 40, 48, 63}) {
+            if (k % ggml_blck_size(type) != 0) {
+                continue;
+            }
+            for (int64_t n : {9, 33, 77, 3200}) {
+                for (int64_t m : {1, 32, 128, 129}) {
+                    test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
+                }
+            }
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 128, 77, k, {2, 3}, {2, 1}));
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 128, 77, k, {3, 2}, {1, 1}, {0, 2, 1, 3}));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 128, 77, 32, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F16, 129, 3200, 48, {1, 1}, {1, 1}));
 
     std::default_random_engine rng(0);
 
